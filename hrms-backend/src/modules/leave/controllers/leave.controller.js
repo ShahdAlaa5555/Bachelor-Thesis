@@ -41,7 +41,7 @@ async function initializeBalances(req, res) {
   );
 }
 async function adjustBalance(req, res) {
-  return sendSuccess(res, await service.adjustLeaveBalance(req.body, uid(req)));
+  return sendSuccess(res, await service.adjustBalance(req.body, uid(req)));
 }
 async function bulkProcessRequests(req, res) {
   const result = await service.bulkProcessRequests(uid(req), req.body);
@@ -145,14 +145,12 @@ async function delegateApproval(req, res) {
     endDate: req.body.endDate || req.body.EndDate || new Date(new Date().setFullYear(new Date().getFullYear() + 1)).toISOString(),
     comments: req.body.comments || req.body.Comments || ''
   };
-  
-  // Pass requestId, userId, and the mapped data to the service
+
   return sendSuccess(
-    res, 
-    await service.delegateApproval(parseInt(req.params.id, 10), uid(req), mappedData)
+    res,
+    await service.delegateApproval(null, uid(req), mappedData)
   );
 }
-
 async function listHolidays(req, res) { return sendSuccess(res, await service.listHolidays(req.query)); }
 async function createHoliday(req, res) { return sendSuccess(res, await service.createHoliday(req.body), 201); }
 async function getLeaveAnalytics(req, res) { return sendSuccess(res, await service.getLeaveAnalytics(req.query)); }
@@ -200,11 +198,41 @@ const syncLeaveToPayroll = async (req, res, next) => {
 async function updateGlobalEntitlements(req, res) {
   return sendSuccess(res, await service.updateGlobalEntitlements(req.body, uid(req)), 200);
 }
+async function bulkSyncPayroll(req, res, next) {
+  try {
+    const { periodYear, periodMonth } = req.body;
+    const result = await service.bulkSyncPayroll(
+      parseInt(periodYear, 10) || new Date().getFullYear(),
+      parseInt(periodMonth, 10) || (new Date().getMonth() + 1),
+      req.user.EmployeeID || req.user.id
+    );
+    res.json({ success: true, data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+/**
+ * REQ-041: Trigger Year-End Carryover
+ */
+async function triggerYearEndCarryover(req, res) {
+  const { previousYear, nextYear, maxCarryDays } = req.body;
+  
+  if (!previousYear || !nextYear) {
+    throw new AppError('PreviousYear and NextYear are required.', 400);
+  }
 
+  const result = await service.performYearEndCarryOver(
+    parseInt(previousYear, 10),
+    parseInt(nextYear, 10),
+    parseInt(maxCarryDays || 5, 10) // Default to 5 days if not provided
+  );
+
+  return sendSuccess(res, { message: 'Year-end carryover processed successfully', processed: result.count });
+}
 module.exports = {
-  listLeaveTypes, createLeaveType, listLeavePolicies, createLeavePolicy,
+  listLeaveTypes, createLeaveType, triggerYearEndCarryover ,listLeavePolicies, createLeavePolicy,
   getMyLeaveBalances, initializeBalances, adjustBalance,bulkProcessRequests,
   submitLeaveRequest, getMyLeaveRequests, listAllLeaveRequests, getLeaveRequest,
-  approveReject, delegateApproval, getManagerInbox,
+  approveReject, delegateApproval, getManagerInbox,bulkSyncPayroll,
   listHolidays, createHoliday, getLeaveAnalytics, updateLeaveRequest, cancelLeave, syncLeaveToPayroll,updateGlobalEntitlements
 };

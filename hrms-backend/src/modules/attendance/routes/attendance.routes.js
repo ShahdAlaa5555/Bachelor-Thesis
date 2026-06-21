@@ -53,7 +53,7 @@ router.get('/',           authorize('Manager', 'HR', 'Payroll', 'Admin'), valida
 router.post('/manual',    authorize('HR', 'Admin'), validate(v.manualAttendanceSchema), ctrl.createManualAttendance);
 
 // ── Per-record Routes (must be LAST to avoid swallowing named segments) ────────
-router.post('/:attendanceId/corrections', validate(v.correctionRequestSchema), ctrl.submitCorrectionRequest);
+router.post('/:attendanceId/corrections', authorize('Manager', 'HR', 'Payroll', 'Admin'), validate(v.correctionRequestSchema), ctrl.submitCorrectionRequest);
 router.get('/:id',                        ctrl.getAttendanceRecord);
 
 module.exports = router;

@@ -84,8 +84,10 @@ const approveRejectSchema = Joi.object({
 
 const delegateApprovalSchema = Joi.object({
   delegateTo: Joi.number().integer().positive().required(),
+  startDate: Joi.date().iso().required(),
+  endDate: Joi.date().iso().min(Joi.ref('startDate')).required(),
   comments: Joi.string().max(500).allow(null, '').optional(),
-});
+}).unknown(true);
 
 const createHolidaySchema = Joi.object({
   HolidayName: Joi.string().max(100).required(),

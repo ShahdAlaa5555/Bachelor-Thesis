@@ -178,50 +178,145 @@ async function processPayrollRun(runId, opts, processedById) {
         orderBy: { EffectiveFrom: 'desc' },
       });
       if (!salaryRecord) { await createOrUpdateException(runId, emp.EmployeeID, 'MissingSalary', 'No active salary record.'); continue; }
+// REPLACE the entire calculation block inside the for (const emp of employees) loop
+// starting from "const baseSalary = Number(salaryRecord.BaseSalary);"
+// to "const netPay = grossEarnings - employeeSI - monthlyTax;"
 
-      const baseSalary = Number(salaryRecord.BaseSalary);
-      const allowances = await prisma.employeeAllowance.findMany({
-        where: { EmployeeID: emp.EmployeeID, EffectiveFrom: { lte: run.PeriodEndDate }, OR: [{ EffectiveTo: null }, { EffectiveTo: { gte: run.PeriodStartDate } }] },
-        include: { Allowance: true },
-      });
+const baseSalary = Number(salaryRecord.BaseSalary);
 
-      const attSummary = await prisma.attendanceSummary.findUnique({
-        where: { UQ_AttSummary_EmpPeriod: { EmployeeID: emp.EmployeeID, PeriodYear: run.PeriodYear, PeriodMonth: run.PeriodMonth } },
-      });
-      if (!attSummary) { await createOrUpdateException(runId, emp.EmployeeID, 'MissingAttendance', 'No attendance summary found.'); continue; }
+// ── Salary spike detection ──
+const previousSalary = await prisma.employeeSalary.findFirst({
+  where: { EmployeeID: emp.EmployeeID, EffectiveTo: { lt: run.PeriodStartDate } },
+  orderBy: { EffectiveTo: 'desc' },
+});
+if (previousSalary) {
+  const prevBase = Number(previousSalary.BaseSalary);
+  if (prevBase > 0 && (baseSalary - prevBase) / prevBase > 0.30) {
+    await createOrUpdateException(runId, emp.EmployeeID, 'SalarySpike',
+      `Salary increased by ${(((baseSalary - prevBase) / prevBase) * 100).toFixed(1)}% vs previous period.`
+    );
+  }
+}
 
-      const unpaidLeave = await prisma.leaveRequest.findMany({
-        where: { EmployeeID: emp.EmployeeID, Status: 'Approved', StartDate: { lte: run.PeriodEndDate }, EndDate: { gte: run.PeriodStartDate }, LeaveType: { IsPaid: false } },
-        select: { TotalDays: true },
-      });
-      const unpaidDays = unpaidLeave.reduce((s, r) => s + Number(r.TotalDays), 0);
-      const dailyRate = baseSalary / workingDaysInMonth;
-      const absenceDeduction = Math.min((unpaidDays + Number(attSummary.AbsentDays)) * dailyRate, run.Policy.MaxMonthlyDeductionDays * dailyRate);
+// ── Working days from policy (not hardcoded) ──
+const workingDaysInMonth = Number(run.Policy.WorkingDaysInMonth) || 22;
+const hoursPerDay        = Number(run.Policy.WorkingHoursPerDay) || 8;
+const dailyRate          = baseSalary / workingDaysInMonth;
+const hourlyRate         = dailyRate / hoursPerDay;
 
-      const overtimeHours = Number(attSummary.TotalOvertimeHrs || 0);
-      let overtimePay = 0;
-      if (overtimeHours > 0 && run.Policy.OvertimeRule) {
-        const hourlyRate = baseSalary / (workingDaysInMonth * 8);
-        overtimePay = overtimeHours * hourlyRate * Number(run.Policy.OvertimeRule.Multiplier);
-      }
+// ── Allowances ──
+const allowances = await prisma.employeeAllowance.findMany({
+  where: { EmployeeID: emp.EmployeeID, EffectiveFrom: { lte: run.PeriodEndDate }, OR: [{ EffectiveTo: null }, { EffectiveTo: { gte: run.PeriodStartDate } }] },
+  include: { Allowance: true },
+});
 
-      const allowancesTotal = allowances.reduce((s, ea) => s + (ea.OverrideAmount !== null ? Number(ea.OverrideAmount) : Number(ea.Allowance.Amount)), 0);
-      const approvedClaims = await prisma.reimbursementClaim.findMany({
-        where: { 
-          EmployeeID: emp.EmployeeID, 
-          Status: 'Approved',
-      
+// ── Attendance summary (must exist) ──
+const attSummary = await prisma.attendanceSummary.findUnique({
+  where: { UQ_AttSummary_EmpPeriod: { EmployeeID: emp.EmployeeID, PeriodYear: run.PeriodYear, PeriodMonth: run.PeriodMonth } },
+});
+if (!attSummary) { await createOrUpdateException(runId, emp.EmployeeID, 'MissingAttendance', 'No attendance summary. Generate summary first.'); continue; }
 
-        }
-      });
-      const claimsTotal = approvedClaims.reduce((s, c) => s + Number(c.Amount), 0);
-      const grossEarnings = baseSalary + allowancesTotal + overtimePay + claimsTotal - absenceDeduction;
-      const siWage = baseSalary;
-      const employeeSI = siWage * siConfig.employeeRate;
-      const employerSI = siWage * siConfig.employerRate;
-      const annualTax = await calculateAnnualTax((grossEarnings - employeeSI) * 12, run.PeriodYear);
-      const monthlyTax = annualTax / 12;
-      const netPay = grossEarnings - employeeSI - monthlyTax;
+// ── Absence deduction — per Egyptian Labor Law, no cap ──
+// AbsentDays from attendance summary already excludes weekends and holidays
+const absentDays       = Number(attSummary.AbsentDays || 0);
+const absenceDeduction = parseFloat((absentDays * dailyRate).toFixed(2));
+
+// ── Lateness deduction ──
+const latenessMins       = Number(attSummary.TotalLatenessMins || 0);
+const latenessDeduction  = parseFloat(((latenessMins / 60) * hourlyRate).toFixed(2));
+
+// ── Unpaid leave deduction (cross-reference LeaveRequest directly) ──
+const unpaidLeave = await prisma.leaveRequest.findMany({
+  where: {
+    EmployeeID: emp.EmployeeID,
+    Status: 'Approved',
+    StartDate: { lte: run.PeriodEndDate },
+    EndDate:   { gte: run.PeriodStartDate },
+    LeaveType: { IsPaid: false },
+  },
+  select: { TotalDays: true },
+});
+const unpaidDays           = unpaidLeave.reduce((s, r) => s + Number(r.TotalDays), 0);
+const unpaidLeaveDeduction = parseFloat((unpaidDays * dailyRate).toFixed(2));
+
+// ── Overtime ──
+const overtimeHours = Number(attSummary.TotalOvertimeHrs || 0);
+let overtimePay = 0;
+if (overtimeHours > 0 && run.Policy.OvertimeRule) {
+  overtimePay = parseFloat((overtimeHours * hourlyRate * Number(run.Policy.OvertimeRule.Multiplier)).toFixed(2));
+}
+
+// ── Allowances total (with Egyptian tax exemption rules) ──
+let taxableAllowances = 0;
+let exemptAllowances  = 0;
+const allowanceLines  = [];
+
+allowances.forEach((ea) => {
+  const amount = ea.OverrideAmount !== null ? Number(ea.OverrideAmount) : Number(ea.Allowance.Amount);
+  const name   = ea.Allowance.AllowanceName.toLowerCase();
+  let exemptPortion = 0;
+
+  // Per Income Tax Law No. 91/2005, Art. 13 exemptions
+  if (name.includes('social') || name.includes('labor day') || name.includes('work nature') || name.includes('special')) {
+    exemptPortion = amount;
+  } else if (name.includes('transportation')) {
+    exemptPortion = Math.min(amount, 300); // EGP 300/month cap per law
+  }
+
+  taxableAllowances += (amount - exemptPortion);
+  exemptAllowances  += exemptPortion;
+  allowanceLines.push({ name: ea.Allowance.AllowanceName, amount });
+});
+
+const totalAllowances = taxableAllowances + exemptAllowances;
+
+// ── Reimbursements ──
+const approvedClaims = await prisma.reimbursementClaim.findMany({
+  where: { EmployeeID: emp.EmployeeID, Status: 'Approved' },
+});
+const claimsTotal = approvedClaims.reduce((s, c) => s + Number(c.Amount), 0);
+
+// ── GROSS INCOME ──
+// Per Egyptian Labor Law: Gross = Base + Allowances + Overtime + Claims - Absences - Lateness - UnpaidLeave
+const grossEarnings = parseFloat((
+  baseSalary
+  + totalAllowances
+  + overtimePay
+  + claimsTotal
+  - absenceDeduction
+  - latenessDeduction
+  - unpaidLeaveDeduction
+).toFixed(2));
+
+// ── SOCIAL INSURANCE — Law 148/2019 ──
+// SI is calculated on BASE SALARY only (not gross), capped at max subscription wage
+// Employee: 7.25%, Employer: 18.75% — total 26%
+const siMaxCap   = 12600; // EGP per month statutory cap (update annually)
+const siWage     = Math.min(baseSalary, siMaxCap);
+const employeeSI = parseFloat((siWage * siConfig.employeeRate).toFixed(2));
+const employerSI = parseFloat((siWage * siConfig.employerRate).toFixed(2));
+
+// ── INCOME TAX — Law 91/2005, amended 2024 ──
+// Taxable base = Gross - Employee SI - Tax-exempt allowances - Personal exemption (via brackets)
+// Personal exemption (EGP 20,000/year) is stored in TaxBracket.PersonalExemptionEGP
+const taxableMonthlyBase = Math.max(0,
+  baseSalary
+  + taxableAllowances   // only taxable portion of allowances
+  + overtimePay
+  - absenceDeduction
+  - latenessDeduction
+  - unpaidLeaveDeduction
+  - employeeSI          // SI is tax-deductible per law
+);
+
+const annualTaxableIncome = taxableMonthlyBase * 12;
+const annualTax           = await calculateAnnualTax(annualTaxableIncome, run.PeriodYear);
+const monthlyTax          = parseFloat((annualTax / 12).toFixed(2));
+
+// ── NET PAY ──
+const netPay = parseFloat(Math.max(0,
+  grossEarnings - employeeSI - monthlyTax
+).toFixed(2));
 
       if (netPay < Number(run.Policy.MinimumWageEGP)) await createOrUpdateException(runId, emp.EmployeeID, 'BelowMinimumWage', `Net pay ${netPay.toFixed(2)} < minimum wage.`);
       // Find this section in processPayrollRun and add:
@@ -242,7 +337,20 @@ approvedClaims.forEach(c => {
 });
       const existingEntry = await prisma.payrollEntry.findUnique({ where: { UQ_PayrollEntry: { PayrollRunID: runId, EmployeeID: emp.EmployeeID } } });
       let entry;
-      const entryData = { AttendanceSummaryID: attSummary.SummaryID, BaseSalary: baseSalary, TotalEarnings: grossEarnings, TotalDeductions: absenceDeduction + employeeSI + monthlyTax, TaxAmount: monthlyTax, UnpaidLeaveDeduction: absenceDeduction, OvertimePay: overtimePay, SocialInsuranceWage: siWage, EmployeeSocialInsurance: employeeSI, EmployerSocialInsurance: employerSI, NetPay: netPay, Status: PAYROLL_ENTRY_STATUS.DRAFT };
+      const entryData = {
+  AttendanceSummaryID:      attSummary.SummaryID,
+  BaseSalary:               baseSalary,
+  TotalEarnings:            grossEarnings,
+  TotalDeductions:          parseFloat((absenceDeduction + latenessDeduction + unpaidLeaveDeduction + employeeSI + monthlyTax).toFixed(2)),
+  TaxAmount:                monthlyTax,
+  UnpaidLeaveDeduction:     parseFloat((absenceDeduction + latenessDeduction + unpaidLeaveDeduction).toFixed(2)),
+  OvertimePay:              overtimePay,
+  SocialInsuranceWage:      siWage,
+  EmployeeSocialInsurance:  employeeSI,
+  EmployerSocialInsurance:  employerSI,
+  NetPay:                   netPay,
+  Status:                   PAYROLL_ENTRY_STATUS.DRAFT,
+};
       if (existingEntry) { entry = await prisma.payrollEntry.update({ where: { EntryID: existingEntry.EntryID }, data: entryData }); }
       else { entry = await prisma.payrollEntry.create({ data: { PayrollRunID: runId, EmployeeID: emp.EmployeeID, ...entryData } }); }
 
@@ -250,7 +358,27 @@ approvedClaims.forEach(c => {
      
       allowances.forEach((ea) => lines.push({ PayTypeID: payTypes.allowance, Description: ea.Allowance.AllowanceName, Amount: ea.OverrideAmount !== null ? Number(ea.OverrideAmount) : Number(ea.Allowance.Amount), Quantity: 1, SourceModule: 'Payroll' }));
       if (overtimePay > 0) lines.push({ PayTypeID: payTypes.overtime, Description: `Overtime (${overtimeHours}h)`, Amount: overtimePay, Quantity: overtimeHours, SourceModule: 'Attendance' });
-      if (absenceDeduction > 0) lines.push({ PayTypeID: payTypes.absenceDeduction, Description: 'Absence Deduction', Amount: -absenceDeduction, Quantity: 1, SourceModule: 'Attendance' });
+     if (absenceDeduction > 0) lines.push({
+  PayTypeID: payTypes.absenceDeduction,
+  Description: `Absence Deduction (${absentDays}d × EGP ${dailyRate.toFixed(2)}/day)`,
+  Amount: -absenceDeduction,
+  Quantity: absentDays,
+  SourceModule: 'Attendance'
+});
+if (latenessDeduction > 0) lines.push({
+  PayTypeID: payTypes.absenceDeduction,
+  Description: `Lateness Deduction (${latenessMins}min × EGP ${hourlyRate.toFixed(2)}/hr)`,
+  Amount: -latenessDeduction,
+  Quantity: 1,
+  SourceModule: 'Attendance'
+});
+if (unpaidLeaveDeduction > 0) lines.push({
+  PayTypeID: payTypes.absenceDeduction,
+  Description: `Unpaid Leave Deduction (${unpaidDays}d × EGP ${dailyRate.toFixed(2)}/day)`,
+  Amount: -unpaidLeaveDeduction,
+  Quantity: unpaidDays,
+  SourceModule: 'Leave'
+});
       if (employeeSI > 0) lines.push({ PayTypeID: payTypes.socialInsurance, Description: `Social Insurance (${(siConfig.employeeRate*100).toFixed(2)}%)`, Amount: -employeeSI, Quantity: 1, SourceModule: 'Payroll' });
       if (monthlyTax > 0) lines.push({ PayTypeID: payTypes.incomeTax, Description: 'Income Tax (Progressive)', Amount: -monthlyTax, Quantity: 1, SourceModule: 'Payroll' });
       await prisma.payrollEntryLine.createMany({ data: lines.map((l) => ({ ...l, EntryID: entry.EntryID })) });
@@ -308,7 +436,24 @@ async function getMyPayslips(employeeId, query) {
   const { page, limit, skip } = getPagination(query);
   const [payslips, total] = await Promise.all([
     prisma.payslip.findMany({ where: { EmployeeID: employeeId }, skip, take: limit, orderBy: { IssueDate: 'desc' },
-      include: { PayrollRun: { select: { PeriodYear: true, PeriodMonth: true, PaymentDate: true } }, Entry: { select: { BaseSalary: true, TotalEarnings: true, TotalDeductions: true, TaxAmount: true, OvertimePay: true, EmployeeSocialInsurance: true, NetPay: true, Lines: { include: { PayType: true } } } } } }),
+      include: {
+        PayrollRun: { select: { PeriodYear: true, PeriodMonth: true, PaymentDate: true } },
+        Entry: {
+          select: {
+            Status: true,
+            BaseSalary: true,
+            TotalEarnings: true,
+            TotalDeductions: true,
+            TaxAmount: true,
+            OvertimePay: true,
+            EmployeeSocialInsurance: true,
+            UnpaidLeaveDeduction: true,
+            NetPay: true,
+            Lines: { include: { PayType: true } }
+          }
+        }
+      }
+    }),
     prisma.payslip.count({ where: { EmployeeID: employeeId } }),
   ]);
   await prisma.payslip.updateMany({ where: { EmployeeID: employeeId, IsViewedByEmployee: false }, data: { IsViewedByEmployee: true } });
@@ -402,13 +547,374 @@ async function resolveReimbursement(claimId, resolverId, data) {
     data: { Status: data.status } // Expects 'Approved' or 'Rejected'
   });
 }
+async function updateEntryPaymentStatus(entryId, status, updatedById) {
+  const validStatuses = ['Draft', 'Finalized', 'Paid', 'Failed', 'Exception'];
+  if (!validStatuses.includes(status)) {
+    throw new AppError(`Invalid status: ${status}`, 400, 'INVALID_STATUS');
+  }
+  const entry = await prisma.payrollEntry.findUnique({ where: { EntryID: entryId } });
+  if (!entry) throw new AppError('Payroll entry not found.', 404, 'NOT_FOUND');
+  return prisma.payrollEntry.update({
+    where: { EntryID: entryId },
+    data: { Status: status, UpdatedAt: new Date() },
+  });
+}
+async function submitPayrollDispute(employeeId, data) {
+  const payslip = await prisma.payslip.findUnique({
+    where: { PayslipID: data.PayslipID },
+    include: { Entry: true }
+  });
+  if (!payslip) throw new AppError('Payslip not found.', 404, 'NOT_FOUND');
+  if (payslip.EmployeeID !== employeeId) throw new AppError('You can only dispute your own payslips.', 403, 'FORBIDDEN');
+
+  return prisma.payrollException.create({
+    data: {
+      PayrollRunID: payslip.PayrollRunID,
+      EmployeeID: employeeId,
+      ExceptionType: 'EmployeeDispute',
+      Description: `[DISPUTE] ${data.DisputeType}: ${data.Reason}`.substring(0, 250),
+      Status: 'Open',
+    }
+  });
+}
+
+async function listMyDisputes(employeeId) {
+  return prisma.payrollException.findMany({
+    where: { EmployeeID: employeeId, ExceptionType: 'EmployeeDispute' },
+    orderBy: { CreatedAt: 'desc' },
+    include: { PayrollRun: { select: { PeriodYear: true, PeriodMonth: true } } }
+  });
+}
+async function getDepartmentPayrollReport(runId) {
+  const entries = await prisma.payrollEntry.findMany({
+    where: { PayrollRunID: runId },
+    include: {
+      Employee: {
+        select: { Department: { select: { DepartmentName: true } } }
+      }
+    }
+  });
+
+  const deptMap = {};
+  for (const entry of entries) {
+    const deptName = entry.Employee?.Department?.DepartmentName || 'Unassigned';
+    if (!deptMap[deptName]) {
+      deptMap[deptName] = { departmentName: deptName, employeeCount: 0, totalGross: 0, totalDeductions: 0, totalTax: 0, totalSI: 0, totalNetPay: 0 };
+    }
+    const d = deptMap[deptName];
+    d.employeeCount++;
+    d.totalGross       += Number(entry.TotalEarnings || 0);
+    d.totalDeductions  += Number(entry.TotalDeductions || 0);
+    d.totalTax         += Number(entry.TaxAmount || 0);
+    d.totalSI          += Number(entry.EmployeeSocialInsurance || 0);
+    d.totalNetPay      += Number(entry.NetPay || 0);
+  }
+
+  return Object.values(deptMap).map(d => ({
+    ...d,
+    totalGross:      parseFloat(d.totalGross.toFixed(2)),
+    totalDeductions: parseFloat(d.totalDeductions.toFixed(2)),
+    totalTax:        parseFloat(d.totalTax.toFixed(2)),
+    totalSI:         parseFloat(d.totalSI.toFixed(2)),
+    totalNetPay:     parseFloat(d.totalNetPay.toFixed(2)),
+    avgNetPay:       parseFloat((d.totalNetPay / d.employeeCount).toFixed(2)),
+  })).sort((a, b) => b.totalNetPay - a.totalNetPay);
+}
+async function listTaxBrackets() {
+  return prisma.taxBracket.findMany({ orderBy: [{ EffectiveYear: 'desc' }, { BracketOrder: 'asc' }] });
+}
+async function createTaxBracket(data) {
+  return prisma.taxBracket.create({ data: {
+    EffectiveYear: parseInt(data.EffectiveYear),
+    BracketOrder: parseInt(data.BracketOrder),
+    FromAmountEGP: parseFloat(data.FromAmountEGP),
+    ToAmountEGP: data.ToAmountEGP ? parseFloat(data.ToAmountEGP) : null,
+    RatePct: parseFloat(data.RatePct),
+    PersonalExemptionEGP: parseFloat(data.PersonalExemptionEGP || 0),
+  }});
+}
+async function getCurrentSocialInsuranceConfig() {
+  const today = new Date();
+  return prisma.socialInsuranceConfig.findFirst({
+    where: { EffectiveFrom: { lte: today }, OR: [{ EffectiveTo: null }, { EffectiveTo: { gte: today } }] },
+    orderBy: { EffectiveFrom: 'desc' },
+  });
+}
+
+async function createOrUpdateSocialInsuranceConfig(data) {
+  const employeeRate = parseFloat(data.EmployeeRatePct);
+  if (isNaN(employeeRate)) throw new AppError('EmployeeRatePct must be a valid number.', 400, 'VALIDATION_ERROR');
+
+  const employerRate = data.EmployerRatePct !== undefined ? parseFloat(data.EmployerRatePct) : 18.75;
+
+  const today = new Date();
+  const existing = await prisma.socialInsuranceConfig.findFirst({
+    where: { EffectiveFrom: { lte: today }, OR: [{ EffectiveTo: null }, { EffectiveTo: { gte: today } }] },
+    orderBy: { EffectiveFrom: 'desc' },
+  });
+
+  if (existing) {
+    const dayBefore = new Date(today);
+    dayBefore.setDate(dayBefore.getDate() - 1);
+    await prisma.socialInsuranceConfig.update({
+      where: { ConfigID: existing.ConfigID },
+      data: { EffectiveTo: dayBefore },
+    });
+  }
+
+  return prisma.socialInsuranceConfig.create({
+    data: {
+      EffectiveFrom: today,
+      EffectiveTo: null,
+      EmployeeRatePct: employeeRate,
+      EmployerRatePct: employerRate,
+      // TotalRatePct removed — it's a computed column in SQL Server,
+      // the database calculates it automatically. Do not write to it.
+      LegalReference: data.LegalReference || 'Law 148/2019',
+    },
+  });
+}
+async function overridePayrollRunStatus(runId, status) {
+  const validStatuses = ['Draft', 'Processing', 'PendingApproval', 'Approved', 'Finalized', 'Paid'];
+  if (!validStatuses.includes(status)) throw new AppError(`Invalid status: ${status}`, 400, 'INVALID_STATUS');
+  const run = await prisma.payrollRun.findUnique({ where: { PayrollRunID: runId } });
+  if (!run) throw new AppError('Payroll run not found.', 404, 'NOT_FOUND');
+  return prisma.payrollRun.update({
+    where: { PayrollRunID: runId },
+    data: { Status: status },
+  });
+}
+async function validateSalaryAgainstGrade(employeeId, baseSalary) {
+  const employee = await prisma.employee.findUnique({
+    where: { EmployeeID: employeeId },
+    include: { Position: { include: { PayGrade: true } } }
+  });
+
+  if (!employee?.Position?.PayGrade) return; // no grade assigned, skip
+
+  const grade    = employee.Position.PayGrade;
+  const minSal   = Number(grade.MinSalary);
+  const maxSal   = Number(grade.MaxSalary);
+  const sal      = Number(baseSalary);
+
+  if (sal > maxSal) {
+    throw new AppError(
+      `Salary ${sal} exceeds maximum allowed for grade "${grade.GradeName}" (max: ${maxSal}).`,
+      400, 'SALARY_ABOVE_GRADE_MAX'
+    );
+  }
+  if (sal < minSal) {
+    throw new AppError(
+      `Salary ${sal} is below minimum for grade "${grade.GradeName}" (min: ${minSal}).`,
+      400, 'SALARY_BELOW_GRADE_MIN'
+    );
+  }
+}
+const ExcelJS = require('exceljs');
+
+async function generateSystemBackupWorkbook() {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'HCM Payroll System';
+  workbook.created = new Date();
+
+  const headerStyle = {
+    font: { bold: true, color: { argb: 'FFFFFFFF' } },
+    fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A56DB' } },
+    alignment: { vertical: 'middle', horizontal: 'center' },
+  };
+
+  // ── Sheet 1: Payroll Runs ──
+  const runsSheet = workbook.addWorksheet('Payroll Runs');
+  runsSheet.columns = [
+    { header: 'Run ID', key: 'id', width: 10 },
+    { header: 'Period', key: 'period', width: 18 },
+    { header: 'Status', key: 'status', width: 16 },
+    { header: 'Total Gross (EGP)', key: 'gross', width: 18 },
+    { header: 'Total Net (EGP)', key: 'net', width: 18 },
+    { header: 'Employees', key: 'emp', width: 12 },
+    { header: 'Payment Date', key: 'payDate', width: 16 },
+    { header: 'Finalized At', key: 'finalized', width: 18 },
+  ];
+  runsSheet.getRow(1).eachCell((cell) => Object.assign(cell, headerStyle));
+
+  const runs = await prisma.payrollRun.findMany({
+    orderBy: { CreatedAt: 'desc' },
+    include: { Policy: { select: { PolicyName: true } } },
+  });
+  runs.forEach((r) => {
+    runsSheet.addRow({
+      id: r.PayrollRunID,
+      period: `${r.PeriodYear}-${String(r.PeriodMonth).padStart(2, '0')}`,
+      status: r.Status,
+      gross: Number(r.TotalGrossAmount),
+      net: Number(r.TotalNetAmount),
+      emp: r.TotalEmployees,
+      payDate: r.PaymentDate ? r.PaymentDate.toISOString().slice(0, 10) : '',
+      finalized: r.FinalizedAt ? r.FinalizedAt.toISOString().slice(0, 10) : '',
+    });
+  });
+  runsSheet.getColumn('gross').numFmt = '#,##0.00';
+  runsSheet.getColumn('net').numFmt = '#,##0.00';
+
+  // ── Sheet 2: Payroll Entries (detail) ──
+  const entriesSheet = workbook.addWorksheet('Payroll Entries');
+  entriesSheet.columns = [
+    { header: 'Run ID', key: 'runId', width: 10 },
+    { header: 'Employee Code', key: 'empCode', width: 16 },
+    { header: 'Employee Name', key: 'empName', width: 24 },
+    { header: 'Base Salary', key: 'base', width: 14 },
+    { header: 'Total Earnings', key: 'earnings', width: 16 },
+    { header: 'Total Deductions', key: 'deductions', width: 16 },
+    { header: 'Tax', key: 'tax', width: 12 },
+    { header: 'Employee SI', key: 'empSI', width: 14 },
+    { header: 'Employer SI', key: 'erSI', width: 14 },
+    { header: 'Overtime Pay', key: 'ot', width: 14 },
+    { header: 'Net Pay', key: 'net', width: 14 },
+    { header: 'Status', key: 'status', width: 14 },
+  ];
+  entriesSheet.getRow(1).eachCell((cell) => Object.assign(cell, headerStyle));
+
+  const entries = await prisma.payrollEntry.findMany({
+    include: { Employee: { select: { EmployeeCode: true, FullName: true } } },
+    orderBy: { CreatedAt: 'desc' },
+    take: 5000, // safety cap
+  });
+  entries.forEach((e) => {
+    entriesSheet.addRow({
+      runId: e.PayrollRunID,
+      empCode: e.Employee.EmployeeCode,
+      empName: e.Employee.FullName,
+      base: Number(e.BaseSalary),
+      earnings: Number(e.TotalEarnings),
+      deductions: Number(e.TotalDeductions),
+      tax: Number(e.TaxAmount),
+      empSI: Number(e.EmployeeSocialInsurance),
+      erSI: Number(e.EmployerSocialInsurance),
+      ot: Number(e.OvertimePay),
+      net: Number(e.NetPay),
+      status: e.Status,
+    });
+  });
+  ['base', 'earnings', 'deductions', 'tax', 'empSI', 'erSI', 'ot', 'net'].forEach((key) => {
+    entriesSheet.getColumn(key).numFmt = '#,##0.00';
+  });
+
+  // ── Sheet 3: Tax Brackets ──
+  const taxSheet = workbook.addWorksheet('Tax Brackets');
+  taxSheet.columns = [
+    { header: 'Year', key: 'year', width: 10 },
+    { header: 'Order', key: 'order', width: 10 },
+    { header: 'From (EGP)', key: 'from', width: 16 },
+    { header: 'To (EGP)', key: 'to', width: 16 },
+    { header: 'Rate %', key: 'rate', width: 10 },
+    { header: 'Personal Exemption', key: 'exemption', width: 18 },
+  ];
+  taxSheet.getRow(1).eachCell((cell) => Object.assign(cell, headerStyle));
+  const brackets = await prisma.taxBracket.findMany({ orderBy: [{ EffectiveYear: 'desc' }, { BracketOrder: 'asc' }] });
+  brackets.forEach((b) => {
+    taxSheet.addRow({
+      year: b.EffectiveYear,
+      order: b.BracketOrder,
+      from: Number(b.FromAmountEGP),
+      to: b.ToAmountEGP !== null ? Number(b.ToAmountEGP) : '∞',
+      rate: Number(b.RatePct),
+      exemption: Number(b.PersonalExemptionEGP),
+    });
+  });
+
+  // ── Sheet 4: Social Insurance Config ──
+  const siSheet = workbook.addWorksheet('Social Insurance');
+  siSheet.columns = [
+    { header: 'Effective From', key: 'from', width: 16 },
+    { header: 'Effective To', key: 'to', width: 16 },
+    { header: 'Employee Rate %', key: 'empRate', width: 16 },
+    { header: 'Employer Rate %', key: 'erRate', width: 16 },
+    { header: 'Total Rate %', key: 'total', width: 14 },
+    { header: 'Legal Reference', key: 'ref', width: 24 },
+  ];
+  siSheet.getRow(1).eachCell((cell) => Object.assign(cell, headerStyle));
+  const siConfigs = await prisma.socialInsuranceConfig.findMany({ orderBy: { EffectiveFrom: 'desc' } });
+  siConfigs.forEach((c) => {
+    siSheet.addRow({
+      from: c.EffectiveFrom.toISOString().slice(0, 10),
+      to: c.EffectiveTo ? c.EffectiveTo.toISOString().slice(0, 10) : 'Current',
+      empRate: Number(c.EmployeeRatePct),
+      erRate: Number(c.EmployerRatePct),
+      total: c.TotalRatePct ? Number(c.TotalRatePct) : Number(c.EmployeeRatePct) + Number(c.EmployerRatePct),
+      ref: c.LegalReference || '',
+    });
+  });
+
+  // ── Sheet 5: Pay Grades ──
+  const gradesSheet = workbook.addWorksheet('Pay Grades');
+  gradesSheet.columns = [
+    { header: 'Code', key: 'code', width: 12 },
+    { header: 'Name', key: 'name', width: 24 },
+    { header: 'Min Salary', key: 'min', width: 14 },
+    { header: 'Max Salary', key: 'max', width: 14 },
+    { header: 'Currency', key: 'cur', width: 10 },
+    { header: 'Active', key: 'active', width: 10 },
+  ];
+  gradesSheet.getRow(1).eachCell((cell) => Object.assign(cell, headerStyle));
+  const grades = await prisma.payGrade.findMany({ orderBy: { MinSalary: 'asc' } });
+  grades.forEach((g) => {
+    gradesSheet.addRow({
+      code: g.GradeCode,
+      name: g.GradeName,
+      min: Number(g.MinSalary),
+      max: Number(g.MaxSalary),
+      cur: g.CurrencyCode,
+      active: g.IsActive ? 'Yes' : 'No',
+    });
+  });
+
+  // ── Sheet 6: Payroll Policies ──
+  const policiesSheet = workbook.addWorksheet('Payroll Policies');
+  policiesSheet.columns = [
+    { header: 'Policy Name', key: 'name', width: 24 },
+    { header: 'Pay Period', key: 'period', width: 14 },
+    { header: 'Cutoff Day', key: 'cutoff', width: 12 },
+    { header: 'Payment Day', key: 'payDay', width: 12 },
+    { header: 'Min Wage (EGP)', key: 'minWage', width: 16 },
+    { header: 'Max Deduction Days', key: 'maxDed', width: 18 },
+    { header: 'Active', key: 'active', width: 10 },
+  ];
+  policiesSheet.getRow(1).eachCell((cell) => Object.assign(cell, headerStyle));
+  const policies = await prisma.payrollPolicy.findMany({ orderBy: { CreatedAt: 'desc' } });
+  policies.forEach((p) => {
+    policiesSheet.addRow({
+      name: p.PolicyName,
+      period: p.PayPeriod,
+      cutoff: p.CutoffDay,
+      payDay: p.PaymentDay,
+      minWage: Number(p.MinimumWageEGP),
+      maxDed: p.MaxMonthlyDeductionDays,
+      active: p.IsActive ? 'Yes' : 'No',
+    });
+  });
+
+  // ── Sheet 7: Backup Metadata ──
+  const metaSheet = workbook.addWorksheet('Backup Info');
+  metaSheet.columns = [{ header: 'Field', key: 'field', width: 24 }, { header: 'Value', key: 'value', width: 40 }];
+  metaSheet.getRow(1).eachCell((cell) => Object.assign(cell, headerStyle));
+  metaSheet.addRows([
+    { field: 'Backup Generated At', value: new Date().toISOString() },
+    { field: 'Total Payroll Runs', value: runs.length },
+    { field: 'Total Payroll Entries', value: entries.length },
+    { field: 'Total Tax Brackets', value: brackets.length },
+    { field: 'System', value: 'HCM Payroll System' },
+  ]);
+
+  return workbook;
+}
 
 // Ensure resolveReimbursement is in module.exports!
 module.exports = {
-  listPayGrades, submitReimbursement, listReimbursements, resolveReimbursement,
-  createPayGrade, listPayTypes, createPayType, listOvertimeRules, createOvertimeRule,
-  listAllowances, listShiftDifferentials, listPayrollPolicies, createPayrollPolicy,
-  listPayrollRuns, getPayrollRunById, createPayrollRun, processPayrollRun,
+  listPayGrades,createTaxBracket,validateSalaryAgainstGrade,overridePayrollRunStatus, listTaxBrackets,submitReimbursement,listMyDisputes, submitPayrollDispute,listReimbursements, resolveReimbursement,updateEntryPaymentStatus,
+  createPayGrade, listPayTypes,getDepartmentPayrollReport, createPayType, listOvertimeRules, createOvertimeRule,
+  listAllowances, listShiftDifferentials, listPayrollPolicies, createPayrollPolicy,generateSystemBackupWorkbook,
+  listPayrollRuns, getPayrollRunById, createPayrollRun, processPayrollRun, getCurrentSocialInsuranceConfig,
+  createOrUpdateSocialInsuranceConfig,
   approvePayrollRun, finalizePayrollRun, generatePayslips, getMyPayslips, getPayslipById,
   listExceptions, resolveException, generateBankFile, getPayrollDashboard, calculateAnnualTax, getEmployeeActiveDays,
 };

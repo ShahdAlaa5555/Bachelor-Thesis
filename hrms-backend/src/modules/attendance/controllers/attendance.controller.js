@@ -122,12 +122,18 @@ exports.getAttendanceCalendar = async (req, res, next) => {
 // ─── Correction Requests ──────────────────────────────────────────────────────
 
 exports.submitCorrectionRequest = async (req, res, next) => {
+  const attendanceId = parseInt(req.params.attendanceId, 10);
+
+if (isNaN(attendanceId)) {
+  throw new AppError('Invalid attendance ID.', 400, 'INVALID_PARAM');
+}
   try {
-    const data = await service.submitCorrectionRequest(
-      parseInt(req.params.attendanceId),
-      resolveEmployeeId(req),
-      req.body,  // { Reason, CorrectedCheckIn, CorrectedCheckOut }
-    );
+    const data =await service.submitCorrectionRequest(
+  attendanceId,
+  req.user.EmployeeID,
+  req.user.role,
+  req.body
+);
     ok(res, data, 201);
   } catch (err) { next(err); }
 };

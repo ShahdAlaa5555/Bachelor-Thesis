@@ -163,6 +163,7 @@ export const leaveAPI = {
   getPolicies:        ()       => api.get('/leave/policies'),
   getMyBalances:      (params) => api.get('/leave/my/balances', { params }),
   getMyRequests:      (params) => api.get('/leave/my/requests', { params }),
+  runCarryOver: (data) => api.post('/leave/settings/carryover', data),
   // ── FIX: Explicitly set multipart/form-data here ──
   submit:             (data)   => api.post('/leave/requests', data, {
     headers: { 'Content-Type': 'multipart/form-data' }
@@ -180,7 +181,8 @@ export const leaveAPI = {
   
   syncPayroll:        (payload) => api.post('/leave/sync/payroll/bulk', payload),
   syncPayrollSingle:  (id, payload) => api.post(`/leave/requests/${id}/sync-payroll`, payload),
-  delegate:           (id, d)  => api.patch(`/leave/requests/${id}/delegate`, d),
+// api/services.js
+delegate: (d) => api.post(`/leave/delegate`, d),  // ← no id, POST not PATCH
   initializeBalances: (data)   => api.post('/leave/balances/initialize', data),
   adjustBalance:      (data)   => api.post('/leave/balances/adjust', data),
   getHolidays:        ()       => api.get('/leave/holidays'),
@@ -208,6 +210,15 @@ export const payrollAPI = {
   getRun:             (id)     => api.get(`/payroll/runs/${id}`),
   processRun:         (id, d)  => api.post(`/payroll/runs/${id}/process`, d),
   approveRun:         (id, d)  => api.post(`/payroll/runs/${id}/approve`, d),
+  createOvertimeRule: (data) => api.post('/payroll/overtime-rules', data),
+createPayType:      (data) => api.post('/payroll/pay-types', data),
+updateEntryStatus: (id, data) => api.patch(`/payroll/entries/${id}/status`, data),
+submitDispute:   (data)   => api.post('/payroll/disputes', data),
+listMyDisputes:  ()       => api.get('/payroll/disputes/me'),
+getTaxBrackets:    ()      => api.get('/payroll/tax-brackets'),
+createTaxBracket:  (data)  => api.post('/payroll/tax-brackets', data),
+updateEntryStatus: (id, d) => api.patch(`/payroll/entries/${id}/status`, d),
+getDeptReport:          (runId)  => api.get(`/payroll/reports/department?runId=${runId}`),
   finalizeRun:        (id)     => api.post(`/payroll/runs/${id}/finalize`),
   generatePayslips:   (id)     => api.post(`/payroll/runs/${id}/payslips`),
   generateBankFile:   (id, d)  => api.post(`/payroll/runs/${id}/bank-file`, d),

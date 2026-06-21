@@ -22,7 +22,7 @@ export default function Sidebar({ collapsed, onToggle }) {
   const isHRorAdmin = ['HR', 'Admin'].includes(userRole);
   
   // 2. Broad Leadership check (includes HR, Admins, and all University Managers)
-  const isManager = ['Manager', 'Supervisor', 'Professor', 'Head of Department', 'HR', 'Admin'].includes(userRole);
+  const isManager = ['HR', 'Admin'].includes(userRole);
 
   const handleLogout = () => { logout(); navigate('/login'); };
 

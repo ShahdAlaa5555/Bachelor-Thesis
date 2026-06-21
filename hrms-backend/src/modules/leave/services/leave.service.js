@@ -53,37 +53,156 @@ async function createLeavePolicy(data) {
 // ── BALANCE MANAGEMENT ───────────────────────────────────────────────────────
 
 async function getLeaveBalanceDashboard(employeeId, year = new Date().getFullYear()) {
-  return prisma.leaveBalance.findMany({
+  const employee = await prisma.employee.findUnique({
+    where: { EmployeeID: employeeId },
+    select: { StartDate: true }
+  });
+  if (!employee) throw new AppError('Employee not found.', 404);
+
+  const balances = await prisma.leaveBalance.findMany({
     where: { EmployeeID: employeeId, BalanceYear: year },
     include: { LeaveType: true },
   });
+
+  const tenureMonths = dayjs().diff(dayjs(employee.StartDate), 'month');
+  const sixMonthEligibilityDate = dayjs(employee.StartDate).add(6, 'month');
+  const isEligibleNow = tenureMonths >= 6;
+
+  return balances.map((b) => {
+    const typeName = b.LeaveType.LeaveTypeName.toLowerCase();
+    const requiresSixMonths = typeName.includes('annual') || typeName.includes('sick');
+
+    const entitledDays = Number(b.EntitledDays);
+    const usedDays = Number(b.UsedDays);
+    const pendingDays = Number(b.PendingDays);
+
+    let remainingDays;
+    let availabilityStatus;
+    let availableFrom = null;
+
+    if (requiresSixMonths && !isEligibleNow) {
+      remainingDays = 0;
+      availabilityStatus = 'LOCKED';
+      availableFrom = sixMonthEligibilityDate.format('YYYY-MM-DD');
+    } else {
+      remainingDays = Math.round(
+        entitledDays + Number(b.CarryOverDays || 0) + Number(b.AdjustedDays || 0) - usedDays - pendingDays
+      );
+      availabilityStatus = 'AVAILABLE';
+    }
+
+    return {
+      leaveTypeId: b.LeaveTypeID,
+      leaveTypeName: b.LeaveType.LeaveTypeName,
+      entitledDays,
+      usedDays,
+      pendingDays,
+      remainingDays,
+      availabilityStatus,
+      availableFrom
+    };
+  });
 }
 
-async function initializeLeaveBalances(employeeId, year, specificLeaveTypeId = null) {
-  // 1. Fetch the leave types to assign (either a specific one, or all of them)
-  const whereClause = specificLeaveTypeId ? { LeaveTypeID: specificLeaveTypeId } : {};
-  const types = await prisma.leaveType.findMany({ where: whereClause });
+const {
+  getStatutoryAnnualEntitlement,
+  getFirstYearAnnualEntitlement,
+  getSickLeaveEntitlement,
+  prorateByCompletedMonths
+} = require('../utils/leave.calculation.util');
 
+async function initializeLeaveBalances(employeeId, year, specificLeaveTypeId = null) {
+  const employee = await prisma.employee.findUnique({ where: { EmployeeID: employeeId } });
+  if (!employee) throw new AppError('Employee not found.', 404);
+
+  const whereClause = specificLeaveTypeId ? { LeaveTypeID: specificLeaveTypeId } : { IsActive: true };
+  const types = await prisma.leaveType.findMany({ where: whereClause });
   if (types.length === 0) throw new AppError('No leave types found to assign.', 404);
+
+  const yearStart = new Date(`${year}-01-01`);
+  const yearEnd = new Date(`${year}-12-31`);
+  const startDate = new Date(employee.StartDate);
+
+  // FIXED: isFirstYear = employee has NOT completed 12 months of service
+  // by the start of this balance year — not just "hired in the same calendar year"
+  const completedOneYearByYearStart = dayjs(yearStart).isAfter(
+    dayjs(startDate).add(1, 'year')
+  );
+  const isFirstYear = !completedOneYearByYearStart;
+
+  // For proration of other leave types: how many months did they work
+  // within THIS calendar year specifically?
+  const workedFromThisYear = dayjs(startDate).isAfter(dayjs(yearStart))
+    ? startDate   // hired mid-year: prorate from StartDate
+    : yearStart;  // hired before this year: full year
 
   let assignedCount = 0;
 
-  // 2. Loop through and assign the balance using the type's ACTUAL DefaultDays
   for (const t of types) {
-    const entitledDays = t.DefaultDays || 21; // Fallback to 21 if db is empty
+    const policy = await prisma.leavePolicy.findFirst({
+      where: {
+        LeaveTypeID: t.LeaveTypeID,
+        IsActive: true,
+        EffectiveFrom: { lte: yearEnd },
+        OR: [{ EffectiveTo: null }, { EffectiveTo: { gte: yearStart } }],
+        AND: [{
+          OR: [
+            { EmploymentType: null },
+            { EmploymentType: '' },
+            { EmploymentType: employee.EmploymentType }
+          ]
+        }]
+      },
+      orderBy: { EffectiveFrom: 'desc' },
+      include: { SickLeaveTiers: true }
+    });
 
-    // Upsert ensures we don't crash if a balance already exists for this year
+    if (!policy) continue;
+
+    if (policy.MinTenureMonths) {
+      const tenureMonths = dayjs(yearEnd).diff(dayjs(startDate), 'month');
+      if (tenureMonths < policy.MinTenureMonths) continue;
+    }
+
+    const typeName = t.LeaveTypeName.toLowerCase();
+    let entitledDays;
+
+    if (typeName.includes('annual')) {
+      if (isFirstYear) {
+        // First employment year: flat 15 days after 6-month milestone
+        // Pass the actual StartDate so the 6-month check is from employment start,
+        // not from Jan 1 of the balance year
+        entitledDays = getFirstYearAnnualEntitlement(startDate, year);
+      } else {
+        // Beyond first employment year: statutory tiers (21/30/45)
+        entitledDays = getStatutoryAnnualEntitlement(employee, yearEnd);
+        const policyMax = Number(policy.MaxDaysPerYear);
+        if (policyMax > entitledDays) {
+          entitledDays = Math.round(policyMax);
+        }
+      }
+
+    } else if (typeName.includes('sick')) {
+      // 3-year rolling cycle cap — availability enforced at request time
+      entitledDays = 360;
+
+    } else {
+      // All other leave types: prorate by months worked within THIS calendar year
+      const maxDays = Number(policy.MaxDaysPerYear) || 0;
+      const isHiredMidThisYear = dayjs(startDate).isAfter(dayjs(yearStart));
+
+      if (isHiredMidThisYear) {
+        entitledDays = prorateByCompletedMonths(maxDays, startDate, yearEnd);
+      } else {
+        entitledDays = Math.round(maxDays);
+      }
+    }
+
     await prisma.leaveBalance.upsert({
       where: {
-        UQ_LeaveBalance: {
-          EmployeeID: employeeId,
-          LeaveTypeID: t.LeaveTypeID,
-          BalanceYear: year
-        }
+        UQ_LeaveBalance: { EmployeeID: employeeId, LeaveTypeID: t.LeaveTypeID, BalanceYear: year }
       },
-      update: {
-        EntitledDays: entitledDays // Refresh the entitlement to the default
-      },
+      update: { EntitledDays: entitledDays },
       create: {
         EmployeeID: employeeId,
         LeaveTypeID: t.LeaveTypeID,
@@ -91,7 +210,8 @@ async function initializeLeaveBalances(employeeId, year, specificLeaveTypeId = n
         EntitledDays: entitledDays,
         UsedDays: 0,
         PendingDays: 0,
-        CarryOverDays: 0
+        CarryOverDays: 0,
+        AdjustedDays: 0
       }
     });
     assignedCount++;
@@ -103,18 +223,36 @@ async function initializeLeaveBalances(employeeId, year, specificLeaveTypeId = n
  * FIX C: Real Adjust Balance (No Mock)
  */
 async function adjustLeaveBalance(data, adminId) {
-  const { EmployeeID, LeaveTypeID, AdjustedDays, Reason } = data;
-  const balance = await prisma.leaveBalance.findUnique({
-    where: { UQ_LeaveBalance: { 
-      EmployeeID, LeaveTypeID, BalanceYear: new Date().getFullYear() 
-    }}
-  });
+  const { EmployeeID, LeaveTypeID, BalanceYear, AdjustedDays, Reason } = data;
 
+  const balance = await prisma.leaveBalance.findUnique({
+    where: { UQ_LeaveBalance: { EmployeeID, LeaveTypeID, BalanceYear } }
+  });
   if (!balance) throw new AppError('Balance record not found', 404);
 
-  const updated = await prisma.leaveBalance.update({
-    where: { LeaveBalanceID: balance.LeaveBalanceID },
-    data: { UsedDays: { increment: -parseFloat(AdjustedDays) } }
+  const delta = parseFloat(AdjustedDays);
+  const previousBalance = Number(balance.AdjustedDays || 0);
+  const newBalance = previousBalance + delta;
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const result = await tx.leaveBalance.update({
+      where: { LeaveBalanceID: balance.LeaveBalanceID },
+      data: { AdjustedDays: newBalance }
+    });
+
+    await tx.leaveBalanceAdjustmentLog.create({
+      data: {
+        EmployeeID, LeaveTypeID, BalanceYear,
+        AdjustedDays: delta,
+        PreviousBalance: previousBalance,
+        NewBalance: newBalance,
+        AdjustmentType: 'CORRECTION',
+        Reason,
+        AdjustedBy: adminId
+      }
+    });
+
+    return result;
   });
 
   await notify({
@@ -124,27 +262,21 @@ async function adjustLeaveBalance(data, adminId) {
     body: `Your leave balance was adjusted by ${AdjustedDays} days. Reason: ${Reason}`,
     sourceModule: 'Leave'
   });
+
   return updated;
 }
 
 // ── LEAVE REQUEST CORE ───────────────────────────────────────────────────────
 
 async function submitLeaveRequest(employeeId, data) {
-
-  // ── TEMPORARY DIAGNOSTIC — REMOVE AFTER FIX ──
-  console.log('=== SERVICE RECEIVED ===');
-  console.log('typeof data.documentReference:', typeof data.documentReference);
-  console.log('data.documentReference value:', data.documentReference);
-  console.log('========================');
-  // ── NORMALIZE INPUT ─────────────────────────────
   const leaveTypeId = Number(data.leaveTypeId || data.LeaveTypeID);
   const startDate = data.startDate || data.StartDate;
   const endDate = data.endDate || data.EndDate;
   const reason = data.reason;
-const documentReference =
-  data.documentReference && typeof data.documentReference === 'string'
-    ? data.documentReference.trim() || null
-    : null;
+  const documentReference =
+    data.documentReference && typeof data.documentReference === 'string'
+      ? data.documentReference.trim() || null
+      : null;
 
   const start = new Date(startDate);
   const end = new Date(endDate);
@@ -152,77 +284,116 @@ const documentReference =
   if (!leaveTypeId) {
     throw new AppError("leaveTypeId is missing or invalid", 400);
   }
-
   if (isNaN(start.getTime()) || isNaN(end.getTime())) {
     throw new AppError("Invalid startDate or endDate", 400);
   }
 
   const year = start.getFullYear();
 
-  // ── FETCH CONTEXT ───────────────────────────────
-  const [policy, employee, existingBalance] = await Promise.all([
-    prisma.leavePolicy.findFirst({
-      where: { LeaveTypeID: leaveTypeId, IsActive: true }
-    }),
-    prisma.employee.findUnique({
-      where: { EmployeeID: employeeId }
-    }),
+  // ── FETCH CONTEXT FIRST ──────────────────────────
+  const [policy, employee, existingBalance, leaveType] = await Promise.all([
+    prisma.leavePolicy.findFirst({ where: { LeaveTypeID: leaveTypeId, IsActive: true } }),
+    prisma.employee.findUnique({ where: { EmployeeID: employeeId } }),
     prisma.leaveBalance.findUnique({
-      where: {
-        UQ_LeaveBalance: {
-          EmployeeID: employeeId,
-          LeaveTypeID: leaveTypeId,
-          BalanceYear: year
-        }
-      }
-    })
+      where: { UQ_LeaveBalance: { EmployeeID: employeeId, LeaveTypeID: leaveTypeId, BalanceYear: year } }
+    }),
+    prisma.leaveType.findUnique({ where: { LeaveTypeID: leaveTypeId } })
   ]);
 
-  if (!employee) {
-    throw new AppError("Employee not found", 404);
+  if (!employee) throw new AppError("Employee not found", 404);
+  if (!existingBalance) throw new AppError("Leave balance not found for the requested year.", 404);
+  if (!leaveType) throw new AppError("Leave type not found", 404);
+
+  const leaveTypeName = leaveType.LeaveTypeName.toLowerCase();
+  const isSickLeave = leaveTypeName.includes('sick');
+  const isAnnualLeave = leaveTypeName.includes('annual');
+
+  // ── 6-MONTH SERVICE ELIGIBILITY GATE (Annual & Sick leave) ──────────────
+  const tenureMonthsAtRequest = dayjs(start).diff(dayjs(employee.StartDate), 'month');
+
+  if ((isAnnualLeave || isSickLeave) && tenureMonthsAtRequest < 6) {
+    const leaveTypeLabel = isAnnualLeave ? 'Annual' : 'Sick';
+    throw new AppError(
+      `${leaveTypeLabel} leave is not yet available. Employees become eligible after completing ` +
+      `6 months of service (currently ${tenureMonthsAtRequest} month(s), since ${dayjs(employee.StartDate).format('YYYY-MM-DD')}).`,
+      400
+    );
   }
 
-  if (!existingBalance) {
-    throw new AppError("Leave balance not found for the requested year.", 404);
-  }
-
-  // ── TENURE CHECK ────────────────────────────────
+  // ── TENURE CHECK (policy-level, separate from the 6-month statutory gate above) ──
   const tenureMonths = dayjs().diff(dayjs(employee.StartDate), 'month');
   if (policy?.MinTenureMonths && tenureMonths < policy.MinTenureMonths) {
-    throw new AppError(
-      `Tenure requirement not met. Minimum: ${policy.MinTenureMonths} months.`,
-      400
-    );
+    throw new AppError(`Tenure requirement not met. Minimum: ${policy.MinTenureMonths} months.`, 400);
   }
 
-  // ── NOTICE CHECK ────────────────────────────────
+  // ── NOTICE CHECK ──────────────────────────────────
   const noticeDays = dayjs(start).diff(dayjs(), 'day');
   if (policy?.NoticePeriodDays && noticeDays < policy.NoticePeriodDays) {
-    throw new AppError(
-      `Notice period violation. ${policy.NoticePeriodDays} days required.`,
-      400
-    );
+    throw new AppError(`Notice period violation. ${policy.NoticePeriodDays} days required.`, 400);
   }
 
-  // ── BUSINESS DAYS ───────────────────────────────
+  // ── BUSINESS DAYS ─────────────────────────────────
   const holidays = await getHolidayDatesInRange(employeeId, start, end);
   const totalDays = countEgyptianBusinessDays(start, end, holidays);
 
-  // ── BALANCE CHECK ────────────────────────────────
-  const available =
-    (Number(existingBalance.EntitledDays) +
-      Number(existingBalance.CarryOverDays || 0)) -
-    (Number(existingBalance.UsedDays) +
-      Number(existingBalance.PendingDays || 0));
-
-  if (totalDays > available) {
-    throw new AppError(
-      `Insufficient leave balance. Requested: ${totalDays}, Available: ${available}`,
-      400
-    );
+  // ── LEAVE-TYPE-SPECIFIC LEGAL VALIDATION ────────────────────────────────
+  if (leaveTypeName.includes('emergency') || leaveTypeName.includes('accidental')) {
+    if (totalDays > 2) {
+      throw new AppError('Emergency/Accidental leave cannot exceed 2 consecutive days per instance.', 400);
+    }
   }
 
-  // ── TRANSACTION ────────────────────────────────
+  if (leaveTypeName.includes('hajj')) {
+    const tenureYears = dayjs(start).diff(dayjs(employee.StartDate), 'year');
+    if (tenureYears < 5) {
+      throw new AppError('Hajj leave requires a minimum of 5 years of service.', 400);
+    }
+    const priorHajj = await prisma.leaveRequest.findFirst({
+      where: { EmployeeID: employeeId, LeaveTypeID: leaveTypeId, Status: { in: ['APPROVED', 'SUBMITTED'] } }
+    });
+    if (priorHajj) {
+      throw new AppError('Hajj leave can only be granted once during employment.', 400);
+    }
+  }
+
+  // ── BALANCE CHECK ─────────────────────────────────
+  let sickCycleInfo = null;
+
+  if (isSickLeave) {
+    const lookbackStart = dayjs(start).subtract(3, 'year').toDate();
+    const approvedSickRequests = await prisma.leaveRequest.findMany({
+      where: { EmployeeID: employeeId, LeaveTypeID: leaveTypeId, Status: 'APPROVED', StartDate: { gte: lookbackStart } },
+      orderBy: { StartDate: 'asc' }
+    });
+
+    sickCycleInfo = getSickLeaveCycleStatus(approvedSickRequests, start);
+
+    if (totalDays > sickCycleInfo.daysRemaining) {
+      throw new AppError(
+        `Insufficient sick leave balance. Requested: ${totalDays}, Remaining in 3-year cycle: ${sickCycleInfo.daysRemaining} ` +
+        `(${sickCycleInfo.daysUsed}/360 days already used since ${sickCycleInfo.cycleStartDate ? dayjs(sickCycleInfo.cycleStartDate).format('YYYY-MM-DD') : 'cycle start'}).`,
+        400
+      );
+    }
+
+    if (leaveType.RequiresDocument && !documentReference) {
+      throw new AppError('Sick leave requires a medical certificate document reference.', 400);
+    }
+  } else {
+    const carryOverValid = existingBalance.CarryOverExpiryYear == null || year <= existingBalance.CarryOverExpiryYear;
+    const effectiveCarryOver = carryOverValid ? Number(existingBalance.CarryOverDays || 0) : 0;
+
+    const available = Math.round(
+      (Number(existingBalance.EntitledDays) + effectiveCarryOver + Number(existingBalance.AdjustedDays || 0)) -
+      (Number(existingBalance.UsedDays) + Number(existingBalance.PendingDays || 0))
+    );
+
+    if (totalDays > available) {
+      throw new AppError(`Insufficient leave balance. Requested: ${totalDays}, Available: ${available}`, 400);
+    }
+  }
+
+  // ── TRANSACTION ───────────────────────────────────
   const request = await prisma.$transaction(async (tx) => {
     const newReq = await tx.leaveRequest.create({
       data: {
@@ -237,25 +408,23 @@ const documentReference =
       },
     });
 
-    await tx.leaveBalance.update({
-      where: { LeaveBalanceID: existingBalance.LeaveBalanceID },
-      data: { PendingDays: { increment: totalDays } },
-    });
+    if (!isSickLeave) {
+      await tx.leaveBalance.update({
+        where: { LeaveBalanceID: existingBalance.LeaveBalanceID },
+        data: { PendingDays: { increment: totalDays } },
+      });
+    }
 
     return newReq;
   });
 
-  // ── NOTIFICATION ────────────────────────────────
-  const emp = await prisma.employee.findUnique({
-    where: { EmployeeID: employeeId }
-  });
-
-  if (emp?.SupervisorID) {
+  // ── NOTIFICATION ──────────────────────────────────
+  if (employee?.SupervisorID) {
     await notify({
-      recipientId: emp.SupervisorID,
+      recipientId: employee.SupervisorID,
       eventCode: 'LEAVE_SUBMITTED',
       title: 'New Leave Request',
-      body: `${emp.FirstName} submitted a request for ${totalDays} days.`,
+      body: `${employee.FirstName} submitted a request for ${totalDays} days.`,
       sourceModule: 'Leave',
       sourceEntityId: request.LeaveRequestID,
     });
@@ -430,34 +599,41 @@ async function bulkProcessRequests(reviewerId, { requestIds, decision, comments 
 // src/modules/leave/services/leave.service.js
 
 async function delegateApproval(requestId, delegatorId, data) {
-  // 1. Validate that the delegate exists
   const delegate = await prisma.employee.findUnique({
     where: { EmployeeID: parseInt(data.delegateTo || data.delegateId, 10) }
   });
 
   if (!delegate) throw new AppError('Delegate employee not found', 404);
 
-  // 2. Create the delegation record
-  // Note: Ensure your schema has a 'LeaveDelegation' table
+  // Parse once, reuse everywhere — avoids Invalid Date in the body
+  const startDate = new Date(data.startDate || data.StartDate);
+  const endDate   = new Date(data.endDate   || data.EndDate);
+
   const delegation = await prisma.leaveDelegation.create({
     data: {
-      ManagerID: delegatorId,
+      ManagerID:  delegatorId,
       DelegateID: delegate.EmployeeID,
-      StartDate: new Date(data.startDate || data.StartDate),
-      EndDate: new Date(data.endDate || data.EndDate),
-      Status: 'ACTIVE',
-      Notes: data.comments || data.Comments || 'Delegated authority'
+      StartDate:  startDate,
+      EndDate:    endDate,
+      Status:     'ACTIVE',
+      Notes:      data.comments || data.Comments || 'Delegated authority',
     }
   });
 
-  // 3. Notify the delegate that they now have power
+  // Deep-link: delegate clicks notification → lands on delegator's pending queue
+const actionUrl = `/leave?tab=all&delegatedBy=${delegatorId}&delegationId=${delegation.DelegationID}`;
+console.log('NOTIFY PAYLOAD:', { recipientId: delegate.EmployeeID, eventCode: EVENT_CODE.LEAVE_DELEGATION_ACTIVE, sourceEntityId: delegation.DelegationID });
+
   await notify({
-    recipientId: delegate.EmployeeID,
-    eventCode: 'DELEGATION_ACTIVE',
-    title: 'New Delegation Received',
-    body: `You have been granted approval authority until ${new Date(data.endDate).toLocaleDateString()}.`,
-    sourceModule: 'Leave',
-    sourceEntityId: delegation.DelegationID
+    recipientId:    delegate.EmployeeID,
+    eventCode:      EVENT_CODE.LEAVE_DELEGATION_ACTIVE,   // ← 'LV008', not raw string
+    title:          'New Delegation Received',
+    body:           JSON.stringify({
+                      message: `You have been granted approval authority from ${startDate.toLocaleDateString()} until ${endDate.toLocaleDateString()}. Tap to review pending requests.`,
+                      actionUrl,
+                    }),
+    sourceModule:   'Leave',
+    sourceEntityId: delegation.DelegationID,
   });
 
   return delegation;
@@ -645,6 +821,91 @@ async function updateGlobalEntitlements(data, adminId) {
     year: targetYear 
   };
 }
+/**
+ * REQ-041: Automated Year-End Carry-Forward
+ * Calculates unused days, applies caps, and moves them to the next year.
+ */
+const { calculateCarryOver } = require('../utils/leave.calculation.util');
+
+/**
+ * REQ-041: Automated Year-End Carry-Forward (Law 14/2025 compliant)
+ * Carries forward unused Annual leave with a 2-YEAR EXPIRY (time-based,
+ * not a fixed day-count cap). Uses LeaveBalance.CarryOverExpiryYear
+ * (already in schema) to track when carried-over days expire.
+ *
+ * Only applies carry-over logic to ANNUAL leave types — other leave
+ * types (sick, emergency, etc.) typically do not carry over under the law.
+ */
+async function performYearEndCarryOver(previousYear, nextYear) {
+  const balances = await prisma.leaveBalance.findMany({
+    where: { BalanceYear: previousYear },
+    include: { LeaveType: { select: { LeaveTypeName: true } } }
+  });
+
+  const transactionOps = [];
+
+  for (const b of balances) {
+    const typeName = b.LeaveType.LeaveTypeName.toLowerCase();
+
+    // Only Annual leave carries over per the law
+    if (!typeName.includes('annual')) {
+      // Still create next year's record so initializeLeaveBalances can populate it,
+      // but with zero carry-over
+      transactionOps.push(
+        prisma.leaveBalance.upsert({
+          where: {
+            UQ_LeaveBalance: { EmployeeID: b.EmployeeID, LeaveTypeID: b.LeaveTypeID, BalanceYear: nextYear }
+          },
+          update: {},
+          create: {
+            EmployeeID: b.EmployeeID,
+            LeaveTypeID: b.LeaveTypeID,
+            BalanceYear: nextYear,
+            EntitledDays: 0,
+            UsedDays: 0,
+            PendingDays: 0,
+            CarryOverDays: 0,
+            AdjustedDays: 0
+          }
+        })
+      );
+      continue;
+    }
+
+    // Fetch the policy to get CarryOverYears / CarryOverLimit
+    const policy = await prisma.leavePolicy.findFirst({
+      where: { LeaveTypeID: b.LeaveTypeID, IsActive: true },
+      orderBy: { EffectiveFrom: 'desc' }
+    });
+
+    const { carryForwardDays, expiryYear } = calculateCarryOver(b, policy, nextYear);
+
+    transactionOps.push(
+      prisma.leaveBalance.upsert({
+        where: {
+          UQ_LeaveBalance: { EmployeeID: b.EmployeeID, LeaveTypeID: b.LeaveTypeID, BalanceYear: nextYear }
+        },
+        update: {
+          CarryOverDays: carryForwardDays,
+          CarryOverExpiryYear: expiryYear
+        },
+        create: {
+          EmployeeID: b.EmployeeID,
+          LeaveTypeID: b.LeaveTypeID,
+          BalanceYear: nextYear,
+          EntitledDays: 0, // populated later by initializeLeaveBalances
+          UsedDays: 0,
+          PendingDays: 0,
+          CarryOverDays: carryForwardDays,
+          CarryOverExpiryYear: expiryYear,
+          AdjustedDays: 0
+        }
+      })
+    );
+  }
+
+  return prisma.$transaction(transactionOps);
+}
 // ── EXPORTS ──────────────────────────────────────────────────────────────────
 module.exports = {
   listLeaveTypes, 
@@ -670,5 +931,6 @@ module.exports = {
   syncLeaveToPayroll, 
   bulkSyncPayroll,
   updateGlobalEntitlements,
-  bulkProcessRequests
+  bulkProcessRequests,
+  performYearEndCarryOver
 };

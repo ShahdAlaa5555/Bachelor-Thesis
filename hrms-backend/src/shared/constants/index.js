@@ -176,6 +176,9 @@ const EVENT_CODE = Object.freeze({
   // Employee
   EMP_CHANGE_REQUEST: 'EM001',
   EMP_CHANGE_APPROVED: 'EM002',
+    LEAVE_DELEGATION_ACTIVE: 'LV008',  // ← add this
+  LEAVE_DELEGATION_REVOKED:'LV009',  // ← add this too for when you revoke
+
 });
 
 // ─── System Roles ────────────────────────────────────────────────────────────

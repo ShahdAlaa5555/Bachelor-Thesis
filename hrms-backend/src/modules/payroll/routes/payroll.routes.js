@@ -55,8 +55,22 @@ router.get('/reimbursements', ctrl.listReimbursements);
 
 // Submit a new claim (Accessible by all logged-in users)
 router.post('/reimbursements', ctrl.submitReimbursement);
-
+router.patch('/entries/:id/status', authorize('Payroll', 'HR', 'Admin'), ctrl.updateEntryStatus);
+router.post('/disputes', ctrl.submitDispute);
+router.get('/disputes/me', ctrl.listMyDisputes);
+router.get('/reports/department', authorize('Payroll', 'HR', 'Admin'), ctrl.getDeptReport);
+router.get('/tax-brackets',        ctrl.listTaxBrackets);
+router.post('/tax-brackets',       authorize('Admin', 'Payroll'), ctrl.createTaxBracket);
+router.patch('/entries/:id/status', authorize('Payroll', 'HR','Manager', 'Admin'), ctrl.updateEntryStatus);
 // Approve or Reject a claim (HR, Admin, and Payroll only)
+router.patch('/runs/:id/status', authorize('Payroll', 'HR', 'Admin'), ctrl.overrideRunStatus);
+
 // Change the action line to this:
 router.patch('/reimbursements/:id/action', authorize('Payroll', 'HR', 'Admin'), ctrl.actionReimbursement);
+
+// ── Social Insurance Config (matches frontend: POST /payroll/social-insurance) ──
+router.get('/social-insurance', authorize('Payroll', 'HR', 'Admin', 'Legal'), ctrl.getSocialInsuranceConfig);
+router.post('/social-insurance', authorize('Admin', 'Legal'), ctrl.saveSocialInsuranceConfig);
+router.get('/system-backup', authorize('Admin', 'Legal'), ctrl.downloadSystemBackup);
+
 module.exports = router;

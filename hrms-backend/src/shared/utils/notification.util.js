@@ -60,12 +60,16 @@ async function notify({
       logger.info(`[Notification] Email stub triggered for ${eventCode} → recipient ${recipientId}`);
       // await emailService.send({ to: recipientEmail, subject: title, body });
     }
-  } catch (err) {
-    // Never let notification failure crash the main operation
-    logger.error(`[Notification] Failed to create notification: ${err.message}`, {
-      recipientId, eventCode, sourceModule,
-    });
-  }
+} catch (err) {
+  logger.error('[Notification] Failed to create notification — FULL ERROR:', {
+    message:      err.message,
+    code:         err.code,          // Prisma error code e.g. P2002, P2003
+    meta:         err.meta,          // Prisma FK/constraint detail
+    recipientId,
+    eventCode,
+    sourceModule,
+  });
+}
 }
 
 /**

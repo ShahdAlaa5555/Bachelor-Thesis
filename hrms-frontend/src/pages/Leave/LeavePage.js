@@ -1,5 +1,6 @@
 // src/pages/Leave/LeavePage.js
 import React, { useState, useEffect, useCallback } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 import {
   CalendarDays, Plus, Check, X, Clock, AlertCircle,
   Send, BarChart2, Calendar, Edit3, Users, Settings,
@@ -271,7 +272,7 @@ function DelegationPanel({ onDelegate, employees }) {
   const [until, setUntil] = useState('');
   
   const handleActivate = () => {
-    onDelegate(1, { 
+    onDelegate( { 
       delegateTo: parseInt(delegateTo, 10), delegateId: parseInt(delegateTo, 10),
       startDate: new Date().toISOString(), StartDate: new Date().toISOString(),
       endDate: new Date(until).toISOString(), EndDate: new Date(until).toISOString(),
@@ -447,7 +448,7 @@ function AssignEntitlementModal({ employees, leaveTypes, onConfirm, onClose, loa
 }
 
 function ManualAdjustmentModal({ employees, leaveTypes, onConfirm, onClose, loading }) {
-  const [form, setForm] = useState({ EmployeeID: '', LeaveTypeID: '', AdjustedDays: '', Reason: '' });
+  const [form, setForm] = useState({  EmployeeID: '', LeaveTypeID: '', BalanceYear: new Date().getFullYear(), AdjustedDays: '', Reason: '' });
 
   return (
     <InlineModal title="Manual Balance Adjustment" onClose={onClose}>
@@ -466,6 +467,9 @@ function ManualAdjustmentModal({ employees, leaveTypes, onConfirm, onClose, load
       <div className="form-group"><label className="form-label">Adjustment (+/- Days)</label>
         <input className="form-input" type="number" onChange={e => setForm({...form, AdjustedDays: e.target.value})} placeholder="e.g. 5 or -2" />
       </div>
+      <div className="form-group"><label className="form-label">Balance Year</label>
+    <input className="form-input" type="number" value={form.BalanceYear} onChange={e => setForm({...form, BalanceYear: e.target.value})} />
+  </div>
       <div className="form-group"><label className="form-label">Reason</label>
         <textarea className="form-textarea" rows={2} onChange={e => setForm({...form, Reason: e.target.value})} placeholder="Justification..." />
       </div>
@@ -559,6 +563,7 @@ export default function LeavePage() {
   const posId = parseInt(user?.PositionID || user?.positionId || 0, 10);
   const rawRole = String(user?.role || user?.Role || '').toUpperCase();
   const rawTitle = String(user?.position || user?.Position?.PositionTitle || '').toUpperCase();
+  
 
   // 1. HR Manager 
   const isHRManager = posId === 1 || rawTitle === 'HR MANAGER';
@@ -579,7 +584,11 @@ export default function LeavePage() {
   const isManagement = isHRManager || isSupervisor;
   const canDelegate = isHRManager || isSupervisor; 
 
-  const [tab, setTab] = useState('dashboard');
+const [tab, setTab] = useState(() => {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('tab') || 'dashboard';
+});
+
   const [balances, setBalances] = useState([]);
   const [myRequests, setMyReqs] = useState([]);
   const [allRequests, setAll] = useState([]);
@@ -608,6 +617,15 @@ export default function LeavePage() {
   const toggleSelect = (id) => {
     setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
+  const location = useLocation();
+
+
+
+useEffect(() => {
+  const params = new URLSearchParams(location.search);
+  const tabParam = params.get('tab');
+  if (tabParam && tabParam !== tab) setTab(tabParam);
+}, [location.search]);
 
   const selectAllVisible = () => {
     if (selectedIds.length === allRequests.length) setSelectedIds([]);
@@ -723,8 +741,12 @@ export default function LeavePage() {
     }
   };
 
-  const handlePayrollSync = () => leaveAPI.syncPayroll({}).then(() => toast.success("Payroll successfully synced"));
-
+const handlePayrollSync = () => {
+  const now = new Date();
+  leaveAPI.syncPayroll({ periodYear: now.getFullYear(), periodMonth: now.getMonth() + 1 })
+    .then(() => toast.success("Payroll successfully synced"))
+    .catch(err => toast.error(getErrMsg(err)));
+};
   const TABS = [
     { id: 'dashboard', label: 'Dashboard',   icon: BarChart2 },
     { id: 'history',   label: 'My History',  icon: Clock },
@@ -788,19 +810,24 @@ export default function LeavePage() {
         />
       )}
 
-      {showAdjustmentModal && isHRManager && (
-        <ManualAdjustmentModal 
-          employees={employeeDropdownList} 
-          leaveTypes={leaveTypes} 
-          onClose={() => setShowAdjustmentModal(false)}
-          onConfirm={(d) => leaveAPI.adjustBalance(d).then(() => { 
-            toast.success("Balance Adjusted"); 
-            setShowAdjustmentModal(false); 
-            loadData(); 
-          })}
-        />
-      )}
-
+  {showAdjustmentModal && isHRManager && (
+  <ManualAdjustmentModal
+    employees={employeeDropdownList}
+    leaveTypes={leaveTypes}
+    onClose={() => setShowAdjustmentModal(false)}
+    onConfirm={(d) => leaveAPI.adjustBalance({
+      EmployeeID: parseInt(d.EmployeeID, 10),
+      LeaveTypeID: parseInt(d.LeaveTypeID, 10),
+      BalanceYear: parseInt(d.BalanceYear, 10),
+      AdjustedDays: parseFloat(d.AdjustedDays),
+      Reason: d.Reason
+    }).then(() => {
+      toast.success("Balance Adjusted");
+      setShowAdjustmentModal(false);
+      loadData();
+    }).catch(err => toast.error(getErrMsg(err)))}
+  />
+)}
       {isSubmitModalOpen && (
         <InlineModal title="Submit Leave Request" onClose={() => setIsSubmitModalOpen(false)}>
            <SubmitLeaveForm 
@@ -876,9 +903,9 @@ export default function LeavePage() {
     {canDelegate && (
       <DelegationPanel 
         employees={employeeDropdownList} 
-        onDelegate={(id, data) => {
-          if(leaveAPI.delegateApproval) {
-            leaveAPI.delegateApproval(data).then(() => { toast.success("Delegation active!"); loadData(); }).catch(err => toast.error(getErrMsg(err)));
+        onDelegate={( data) => {
+          if(leaveAPI.delegate) {
+            leaveAPI.delegate(data).then(() => { toast.success("Delegation active!"); loadData(); }).catch(err => toast.error(getErrMsg(err)));
           } else {
             toast.success("Delegation data sent! (Hook up API)");
           }
@@ -1021,6 +1048,22 @@ export default function LeavePage() {
                       <button className="btn btn-outline-primary" onClick={handlePayrollSync}>
                         <RefreshCw size={14} className="mr-2"/> Sync Approved Leaves
                       </button>
+                     
+<button 
+  className="btn btn-outline-warning" 
+  onClick={() => {
+    if(window.confirm("Are you sure you want to run year-end carryover?")) {
+      leaveAPI.runCarryOver({ 
+        previousYear: 2025, 
+        nextYear: 2026, 
+        maxCarryDays: 5 
+      }).then(() => toast.success("Carryover complete!"))
+        .catch(err => toast.error(getErrMsg(err)));
+    }
+  }}
+>
+  <RefreshCw size={14} className="mr-2"/> Run Year-End Carryover
+</button>
                       <button className="btn btn-outline-danger" onClick={() => setShowAdjustmentModal(true)}>
                         <AlertCircle size={14} className="mr-2"/> Adjust Individual Balances
                       </button>

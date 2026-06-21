@@ -135,16 +135,34 @@ async function calculateEmployeePayroll(employeeId, payrollRunId, policy, attend
     include: { Allowance: true },
   });
 
+let taxableAllowances = 0;
+  let exemptAllowances = 0;
+
   const allowanceLines = allowances.map((ea) => {
     const rawAmount = Number(ea.OverrideAmount ?? ea.Allowance.Amount);
+    const amount = parseFloat((rawAmount * prorationFactor).toFixed(2));
+    
+    const name = ea.Allowance.AllowanceName.toLowerCase();
+    let exemptPortion = 0;
+
+    // Identify Exemptions based on rules
+    if (name.includes('social') || name.includes('labor day') || name.includes('work nature') || name.includes('special')) {
+        exemptPortion = amount;
+    } else if (name.includes('transportation')) {
+        exemptPortion = Math.min(amount, 300 * prorationFactor);
+    }
+
+    taxableAllowances += (amount - exemptPortion);
+    exemptAllowances += exemptPortion;
+
     return {
       description: ea.Allowance.AllowanceName,
-      amount: parseFloat((rawAmount * prorationFactor).toFixed(2)),
+      amount: amount,
       type: 'Allowance',
     };
   });
 
-  const totalAllowances = allowanceLines.reduce((sum, a) => sum + a.amount, 0);
+  const totalAllowances = taxableAllowances + exemptAllowances;
 
   /// ─── UPDATED: Dynamic Policy Mappings ─────────────────────────────────────────
 
@@ -158,9 +176,10 @@ const hourlyRate = dailyRate / hoursPerDay;
 
   const absentDays = attendanceSummary ? Number(attendanceSummary.AbsentDays || 0) : 0;
   // Apply Cap on Deductions (PR-004)
-  const cappedAbsenceDays = Math.min(absentDays, policy.MaxMonthlyDeductionDays || 30);
-  const absenceDeduction = parseFloat((cappedAbsenceDays * dailyRate).toFixed(2));
-
+// CORRECT
+// CORRECT — per Egyptian Labor Law, absence deduction has no cap
+const totalAbsentDays = unpaidDays + Number(attSummary.AbsentDays || 0);
+const absenceDeduction = parseFloat((totalAbsentDays * dailyRate).toFixed(2));
   const latenessMins = attendanceSummary ? Number(attendanceSummary.TotalLatenessMins || 0) : 0;
   const latenessDeduction = parseFloat(((latenessMins / 60) * hourlyRate).toFixed(2));
 
@@ -171,19 +190,29 @@ const hourlyRate = dailyRate / hoursPerDay;
   const overtimeHours = attendanceSummary ? Number(attendanceSummary.TotalOvertimeHrs) : 0;
   const overtimePay = await calculateOvertimePay(baseSalary, overtimeHours, workingDaysInMonth, policy);
 
-  // ─── TOTALS & TAXES ────────────────────────────────────────────────────────
-  // 1. Calculate Gross Income first using the correct variable name
+// ─── TOTALS & TAXES ────────────────────────────────────────────────────────
+  // 1. Calculate Actual Gross Income
   const grossIncome = baseSalary + totalAllowances + overtimePay - absenceDeduction - unpaidLeaveDeduction - latenessDeduction;
   
+  // 2. Social Insurance (with Statutory Caps)
   const siConfig = await getSocialInsuranceConfig();
-  const siWage = baseSalary; 
+  const siMaxCap = siConfig.MaxSubscriptionWage || 12600; 
+  const siWage = Math.min(baseSalary, siMaxCap); 
   const employeeSI = parseFloat((siWage * (siConfig.EmployeeRatePct / 100)).toFixed(2));
   
-  // 2. Use 'grossIncome' (the variable you defined above) here
-  const incomeTax = await calculateMonthlyIncomeTax(Math.max(0, grossIncome - employeeSI), payRunRecord.PeriodYear);
+  // 3. Life Insurance Exemption (Assuming 0 for now until you fetch it from DB)
+  const monthlyLifeInsurancePremium = 0; 
+  const maxLifeInsuranceExemption = Math.min((baseSalary + taxableAllowances) * 0.15, (10000 / 12));
+  const exemptLifeInsurance = Math.min(monthlyLifeInsurancePremium, maxLifeInsuranceExemption);
 
-  // 3. Use 'grossIncome' here as well
-  let netPay = parseFloat((grossIncome - employeeSI - incomeTax).toFixed(2));
+  // 4. Calculate Taxable Base (Isolating Taxable Allowances only)
+  const taxableMonthlyIncomeBase = baseSalary + taxableAllowances + overtimePay - absenceDeduction - unpaidLeaveDeduction - latenessDeduction;
+  const monthlyTaxableAmount = Math.max(0, taxableMonthlyIncomeBase - employeeSI - exemptLifeInsurance);
+
+  const incomeTax = await calculateMonthlyIncomeTax(monthlyTaxableAmount, payRunRecord.PeriodYear);
+
+  // 5. Final Net Pay Calculation
+  let netPay = parseFloat((grossIncome - employeeSI - incomeTax - monthlyLifeInsurancePremium).toFixed(2));
   
   const minimumWage = Number(policy.MinimumWageEGP) || 6000;
   // ──────────────────────────────────────────────────────────────────────────
@@ -194,7 +223,11 @@ const hourlyRate = dailyRate / hoursPerDay;
   ];
 
   if (overtimePay > 0) lines.push({ description: `Overtime (${overtimeHours}h)`, amount: overtimePay, type: 'OvertimePay' });
-  if (absenceDeduction > 0) lines.push({ description: `Absence Penalty (${cappedAbsenceDays}d)`, amount: -absenceDeduction, type: 'AbsenceDeduction' });
+if (absenceDeduction > 0) lines.push({
+  description: `Absence Deduction (${absentDays}d × EGP ${dailyRate.toFixed(2)}/day)`,
+  amount: -absenceDeduction,
+  type: 'AbsenceDeduction'
+});
   if (latenessDeduction > 0) lines.push({ description: `Lateness Penalty (${(latenessMins/60).toFixed(1)}h)`, amount: -latenessDeduction, type: 'LatenessDeduction' });
   
   lines.push({ description: `Social Insurance (${siConfig.EmployeeRatePct}%)`, amount: -employeeSI, type: 'SocialInsurance' });
@@ -205,7 +238,7 @@ return {
   baseSalary,
   grossIncome,
   totalEarnings: parseFloat((baseSalary + totalAllowances + overtimePay).toFixed(2)),
-  totalDeductions: parseFloat((absenceDeduction + unpaidLeaveDeduction + latenessDeduction + employeeSI + incomeTax).toFixed(2)),
+totalDeductions: parseFloat((absenceDeduction + unpaidLeaveDeduction + latenessDeduction + employeeSI + incomeTax + monthlyLifeInsurancePremium).toFixed(2)),
   netPay: Math.max(0, netPay),
   belowMinimumWage: netPay < minimumWage,  // ← flat, for this test
   flags: {

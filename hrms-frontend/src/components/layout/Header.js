@@ -101,17 +101,63 @@ export default function Header() {
                 {notifications.length === 0 ? (
                   <div style={{ padding: 20, textAlign: 'center', color: '#6b7280', fontSize: '0.85rem' }}>No notifications yet</div>
                 ) : (
-                  notifications.map(n => (
-                    <div key={n.NotificationID} style={{
-                      padding: '12px 16px', borderBottom: '1px solid #f9fafb',
-                      background: n.IsRead ? 'transparent' : '#eff6ff',
-                      cursor: 'pointer'
-                    }}>
-                      <div style={{ fontWeight: 600, fontSize: '0.85rem', marginBottom: 4, color: '#1f2937' }}>{n.Title}</div>
-                      <div style={{ fontSize: '0.8rem', color: '#4b5563', lineHeight: 1.4 }}>{n.Body}</div>
-                      <div style={{ fontSize: '0.7rem', color: '#9ca3af', marginTop: 8 }}>{new Date(n.CreatedAt || Date.now()).toLocaleString()}</div>
-                    </div>
-                  ))
+               notifications.map(n => {
+  let message = n.Body;
+  let actionUrl = null;
+
+  if (n.Body) {
+    try {
+      const parsed = JSON.parse(n.Body);
+      if (parsed && typeof parsed === 'object' && parsed.message) {
+        message = parsed.message;
+        actionUrl = parsed.actionUrl || null;
+      }
+    } catch {
+      // plain text body, leave as-is
+    }
+  }
+
+  return (
+   <div
+  key={n.NotificationID}
+onClick={() => {
+  let message = n.Body;
+  let actionUrl = null;
+
+  if (n.Body) {
+    try {
+      const parsed = JSON.parse(n.Body);
+      if (parsed && typeof parsed === 'object' && parsed.message) {
+        message = parsed.message;
+        actionUrl = parsed.actionUrl || null;
+      }
+    } catch {}
+  }
+
+  alert('actionUrl: ' + actionUrl);
+
+  if (actionUrl) {
+    navigate(actionUrl);
+  }
+  setNotifOpen(false);
+}}
+  style={{
+    padding: '12px 16px', borderBottom: '1px solid #f9fafb',
+    background: n.IsRead ? 'transparent' : '#eff6ff',
+    cursor: 'pointer'
+  }}
+>
+      <div style={{ fontWeight: 600, fontSize: '0.85rem', marginBottom: 4, color: '#1f2937' }}>{n.Title}</div>
+      <div style={{ fontSize: '0.8rem', color: '#4b5563', lineHeight: 1.4 }}>{message}</div>
+      <div style={{ fontSize: '0.7rem', color: '#9ca3af', marginTop: 8 }}>{new Date(n.CreatedAt || Date.now()).toLocaleString()}</div>
+      {actionUrl && (
+        <div style={{ fontSize: '0.7rem', color: '#3b82f6', marginTop: 4, fontWeight: 500 }}>
+          Click to view →
+        </div>
+      )}
+    </div>
+  );
+})
                 )}
               </div>
             </div>

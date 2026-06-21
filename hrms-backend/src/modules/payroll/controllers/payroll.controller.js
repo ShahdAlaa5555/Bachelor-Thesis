@@ -66,12 +66,55 @@ async function actionReimbursement(req, res) {
   );
   return sendSuccess(res, result);
 }
+async function updateEntryStatus(req, res) {
+  return sendSuccess(res, await service.updateEntryPaymentStatus(
+    parseInt(req.params.id), req.body.status, req.user.id
+  ));
+}
+async function submitDispute(req, res) {
+  return sendSuccess(res, await service.submitPayrollDispute(req.user.id, req.body), 201);
+}
+
+async function listMyDisputes(req, res) {
+  return sendSuccess(res, await service.listMyDisputes(req.user.id));
+}
+async function getDeptReport(req, res) {
+  const runId = parseInt(req.query.runId, 10);
+  if (!runId) return res.status(400).json({ success: false, error: { message: 'runId required' } });
+  return sendSuccess(res, await service.getDepartmentPayrollReport(runId));
+}
+async function listTaxBrackets(req, res) { return sendSuccess(res, await service.listTaxBrackets()); }
+async function createTaxBracket(req, res) { return sendSuccess(res, await service.createTaxBracket(req.body), 201); }
 // Don't forget to export it at the bottom:
 // getActiveDays
+async function overrideRunStatus(req, res) {
+  return sendSuccess(res, await service.overridePayrollRunStatus(
+    parseInt(req.params.id, 10), req.body.status
+  ));
+}
+async function getSocialInsuranceConfig(req, res) {
+  const config = await service.getCurrentSocialInsuranceConfig();
+  res.json({ success: true, data: config });
+}
+
+async function saveSocialInsuranceConfig(req, res) {
+  const config = await service.createOrUpdateSocialInsuranceConfig(req.body);
+  res.status(201).json({ success: true, data: config });
+}
+async function downloadSystemBackup(req, res) {
+  const workbook = await service.generateSystemBackupWorkbook();
+
+  const filename = `payroll_backup_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+  await workbook.xlsx.write(res);
+  res.end();
+}
 module.exports = {
-  getDashboard, listPayGrades, listReimbursements, submitReimbursement, actionReimbursement,createPayGrade, listPayTypes, createPayType,
+  getDashboard,listTaxBrackets, downloadSystemBackup,overrideRunStatus,createTaxBracket, listPayGrades,getDeptReport,submitDispute, listMyDisputes, updateEntryStatus,listReimbursements, submitReimbursement, actionReimbursement,createPayGrade, listPayTypes, createPayType,
   listOvertimeRules, createOvertimeRule, listAllowances, listShiftDifferentials,
-  listPolicies, createPolicy, listRuns, createRun, getRun, processRun,getActiveDays,
+  listPolicies, createPolicy, listRuns, createRun, getRun, processRun,getActiveDays,getSocialInsuranceConfig , saveSocialInsuranceConfig ,
   approveRun, finalizeRun, generatePayslips, getMyPayslips, getPayslip,
   listExceptions, resolveException, generateBankFile,
 };

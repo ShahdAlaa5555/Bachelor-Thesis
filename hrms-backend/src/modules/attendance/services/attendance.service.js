@@ -400,10 +400,16 @@ async function createManualAttendance(data, createdById) {
 
 // ─── CORRECTION REQUESTS (Submit Correction button — Image 2) ────────────────
 
-async function submitCorrectionRequest(attendanceId, employeeId, data) {
+async function submitCorrectionRequest(attendanceId, requesterId, requesterRole, data) {
   const record = await prisma.attendanceRecord.findUnique({ where: { AttendanceID: attendanceId } });
   if (!record) throw new AppError('Attendance record not found.', 404, 'NOT_FOUND');
-  if (record.EmployeeID !== employeeId) throw new AppError('You cannot submit a correction for another employee.', 403, 'FORBIDDEN');
+
+  const isOwner = record.EmployeeID === requesterId;
+  const isPrivileged = ['HR', 'Admin'].includes(requesterRole);
+
+  if (!isOwner && !isPrivileged) {
+    throw new AppError('You cannot submit a correction for another employee.', 403, 'FORBIDDEN');
+  }
 
   // Prevent duplicate pending corrections
   const pending = await prisma.attendanceCorrectionRequest.findFirst({
@@ -414,7 +420,8 @@ async function submitCorrectionRequest(attendanceId, employeeId, data) {
   const correction = await prisma.attendanceCorrectionRequest.create({
     data: {
       AttendanceID: attendanceId,
-      EmployeeID: employeeId,
+      EmployeeID: record.EmployeeID,        // always the actual record owner, not the requester
+      RequestedBy: requesterId,             // track who actually submitted it (add this column if it doesn't exist)
       CorrectedCheckIn: data.CorrectedCheckIn ? new Date(data.CorrectedCheckIn) : null,
       CorrectedCheckOut: data.CorrectedCheckOut ? new Date(data.CorrectedCheckOut) : null,
       Reason: data.Reason,
@@ -423,10 +430,10 @@ async function submitCorrectionRequest(attendanceId, employeeId, data) {
   });
 
   await notify({
-    recipientId: employeeId,
+    recipientId: record.EmployeeID,         // notify the actual employee whose attendance changed
     eventCode: EVENT_CODE.ATT_CORRECTION_SUBMITTED,
     title: 'Correction Request Submitted',
-    body: `Your attendance correction for ${dayjs(record.AttendanceDate).format('MMM D, YYYY')} is under review.`,
+    body: `An attendance correction for ${dayjs(record.AttendanceDate).format('MMM D, YYYY')} is under review.`,
     sourceModule: 'Attendance',
     sourceEntityId: correction.CorrectionID,
   });
@@ -665,67 +672,159 @@ if (!data.EffectiveFrom) {
 async function generateAttendanceSummary(employeeId, year, month) {
   const { startDate, endDate } = getMonthBounds(year, month);
 
+  // 1. Fetch employee work location for holiday calendar
+  const employee = await prisma.employee.findUnique({
+    where: { EmployeeID: employeeId },
+    select: { WorkLocationID: true, StartDate: true },
+  });
+
+  // 2. Fetch all attendance records for the period
   const records = await prisma.attendanceRecord.findMany({
     where: {
       EmployeeID: employeeId,
       AttendanceDate: { gte: startDate, lte: endDate },
     },
   });
+  // Build a map for O(1) lookup
+  const recordMap = new Map(
+    records.map(r => [dayjs(r.AttendanceDate).format('YYYY-MM-DD'), r])
+  );
 
+  // 3. Fetch approved leave requests overlapping this period
+  const leaveRequests = await prisma.leaveRequest.findMany({
+    where: {
+      EmployeeID: employeeId,
+      Status: 'Approved',
+      StartDate: { lte: endDate },
+      EndDate:   { gte: startDate },
+    },
+    include: { LeaveType: { select: { IsPaid: true } } },
+  });
+  // Build a set of dates covered by approved leave
+  const leaveDateMap = new Map(); // date -> { isPaid }
+  for (const lr of leaveRequests) {
+    let cur = dayjs(lr.StartDate);
+    const lEnd = dayjs(lr.EndDate);
+    while (cur.isSameOrBefore(lEnd)) {
+      const ds = cur.format('YYYY-MM-DD');
+      if (cur.toDate() >= startDate && cur.toDate() <= endDate) {
+        leaveDateMap.set(ds, { isPaid: lr.LeaveType.IsPaid });
+      }
+      cur = cur.add(1, 'day');
+    }
+  }
+
+  // 4. Fetch public holidays for this period and work location
+  const holidays = await prisma.holidayCalendar.findMany({
+    where: {
+      HolidayDate: { gte: startDate, lte: endDate },
+      OR: [
+        { WorkLocationID: null },
+        { WorkLocationID: employee?.WorkLocationID ?? undefined },
+      ],
+    },
+  });
+  const holidaySet = new Set(
+    holidays.map(h => dayjs(h.HolidayDate).format('YYYY-MM-DD'))
+  );
+
+  // 5. Walk every calendar day in the month
   const summary = {
-    TotalWorkingDays: 0, // Will be set based on working calendar
-    PresentDays: 0,
-    AbsentDays: 0,
-    LeaveDays: 0,
-    HolidayDays: 0,
+    TotalWorkingDays: 0,
+    PresentDays:      0,
+    AbsentDays:       0,
+    LeaveDays:        0,
+    HolidayDays:      0,
     TotalWorkedHours: 0,
     TotalOvertimeHrs: 0,
     TotalLatenessMins: 0,
   };
 
-  for (const r of records) {
-    if (r.Status === ATTENDANCE_STATUS.PRESENT || r.Status === ATTENDANCE_STATUS.CORRECTION) {
-      summary.PresentDays++;
-      summary.TotalWorkedHours += Number(r.WorkedHours || 0);
-      summary.TotalOvertimeHrs += Number(r.OvertimeHours || 0);
-      summary.TotalLatenessMins += Number(r.LatenessMinutes || 0);
-    } else if (r.Status === ATTENDANCE_STATUS.ABSENT) {
-      summary.AbsentDays++;
-    } else if (r.Status === ATTENDANCE_STATUS.ON_LEAVE) {
-      summary.LeaveDays++;
-    } else if (r.Status === ATTENDANCE_STATUS.HOLIDAY) {
-      summary.HolidayDays++;
-    } else if (r.Status === ATTENDANCE_STATUS.HALF_DAY) {
-      summary.PresentDays += 0.5;
-      summary.TotalWorkedHours += Number(r.WorkedHours || 4);
+  let current = dayjs(startDate);
+  const end    = dayjs(endDate);
+
+  while (current.isSameOrBefore(end)) {
+    const dateStr = current.format('YYYY-MM-DD');
+    const dow     = current.day(); // 0=Sun,1=Mon,...,5=Fri,6=Sat
+    const isWeekend = dow === 5 || dow === 6; // Egypt: Fri & Sat
+
+    if (isWeekend) {
+      // Weekends are not working days — skip entirely
+      current = current.add(1, 'day');
+      continue;
     }
+
+    // It's a working day
     summary.TotalWorkingDays++;
+
+    if (holidaySet.has(dateStr)) {
+      // Public holiday
+      summary.HolidayDays++;
+      current = current.add(1, 'day');
+      continue;
+    }
+
+    const record = recordMap.get(dateStr);
+
+    if (record) {
+      // We have an attendance record — trust it
+      const status = record.Status;
+
+      if (status === ATTENDANCE_STATUS.PRESENT || status === ATTENDANCE_STATUS.CORRECTION) {
+        summary.PresentDays++;
+        summary.TotalWorkedHours  += Number(record.WorkedHours    || 0);
+        summary.TotalOvertimeHrs  += Number(record.OvertimeHours  || 0);
+        summary.TotalLatenessMins += Number(record.LatenessMinutes|| 0);
+      } else if (status === ATTENDANCE_STATUS.HALF_DAY) {
+        summary.PresentDays       += 0.5;
+        summary.TotalWorkedHours  += Number(record.WorkedHours || 4);
+        summary.TotalLatenessMins += Number(record.LatenessMinutes || 0);
+      } else if (status === ATTENDANCE_STATUS.ON_LEAVE) {
+        summary.LeaveDays++;
+      } else if (status === ATTENDANCE_STATUS.HOLIDAY) {
+        summary.HolidayDays++;
+        summary.TotalWorkingDays--; // don't count as working day
+      } else if (status === ATTENDANCE_STATUS.ABSENT) {
+        summary.AbsentDays++;
+      }
+      // WEEKEND_WORK — employee worked on weekend, bonus but not a regular working day
+    } else if (leaveDateMap.has(dateStr)) {
+      // No record but approved leave exists for this date
+      summary.LeaveDays++;
+    } else {
+      // No record, no leave, not a holiday, not a weekend = ABSENT
+      summary.AbsentDays++;
+    }
+
+    current = current.add(1, 'day');
   }
 
   const onTimeRate = summary.PresentDays > 0
-    ? parseFloat(((summary.PresentDays - (summary.TotalLatenessMins > 0 ? 1 : 0)) / summary.PresentDays * 100).toFixed(2))
+    ? parseFloat(
+        ((summary.PresentDays - (summary.TotalLatenessMins > 0 ? 1 : 0))
+          / summary.PresentDays * 100).toFixed(2)
+      )
     : 100;
 
-  // Upsert (create or update)
+  const summaryData = {
+    EmployeeID:        employeeId,
+    PeriodYear:        year,
+    PeriodMonth:       month,
+    TotalWorkingDays:  summary.TotalWorkingDays,
+    PresentDays:       summary.PresentDays,
+    AbsentDays:        summary.AbsentDays,
+    LeaveDays:         summary.LeaveDays,
+    HolidayDays:       summary.HolidayDays,
+    TotalWorkedHours:  parseFloat(summary.TotalWorkedHours.toFixed(2)),
+    TotalOvertimeHrs:  parseFloat(summary.TotalOvertimeHrs.toFixed(2)),
+    TotalLatenessMins: summary.TotalLatenessMins,
+    OnTimeRate:        onTimeRate,
+    GeneratedAt:       new Date(),
+  };
+
   const existing = await prisma.attendanceSummary.findUnique({
     where: { UQ_AttSummary_EmpPeriod: { EmployeeID: employeeId, PeriodYear: year, PeriodMonth: month } },
   });
-
-  const summaryData = {
-    EmployeeID: employeeId,
-    PeriodYear: year,
-    PeriodMonth: month,
-    TotalWorkingDays: summary.TotalWorkingDays,
-    PresentDays: summary.PresentDays,
-    AbsentDays: summary.AbsentDays,
-    LeaveDays: summary.LeaveDays,
-    HolidayDays: summary.HolidayDays,
-    TotalWorkedHours: parseFloat(summary.TotalWorkedHours.toFixed(2)),
-    TotalOvertimeHrs: parseFloat(summary.TotalOvertimeHrs.toFixed(2)),
-    TotalLatenessMins: summary.TotalLatenessMins,
-    OnTimeRate: onTimeRate,
-    GeneratedAt: new Date(),
-  };
 
   if (existing) {
     return prisma.attendanceSummary.update({

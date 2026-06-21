@@ -687,7 +687,9 @@ export default function EmployeePage() {
                         <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                           {/* EPIC 5: ASSIGN ROLE BUTTON */}
                           <button className="btn btn-ghost btn-sm btn-icon" style={{ color: 'var(--purple)' }} onClick={() => { setSelectedRole(emp.role || 'Employee'); setRoleModal(emp); }} title="Assign System Role"><Shield size={15} /></button>
-                          
+                          {/* 👇 ADD THIS BUTTON HERE 👇 */}
+      <button className="btn btn-ghost btn-sm btn-icon" style={{ color: 'var(--blue)' }} onClick={() => openViewProfile(emp)} title="View Full Profile"><Eye size={15} /></button>
+      {/* 👆 ──────────────────── 👆 */}
                           <button className="btn btn-ghost btn-sm btn-icon" style={{ color: 'var(--text-secondary)' }} onClick={() => openTimeline(emp)} title="Employment Timeline"><Clock size={15} /></button>
                           <button className="btn btn-ghost btn-sm btn-icon" style={{ color: 'var(--text-secondary)' }} onClick={() => openNotes(emp)} title="Manager Notes"><MessageSquare size={15} /></button>
                           <button className="btn btn-ghost btn-sm btn-icon" style={{ color: 'var(--primary)' }} onClick={() => openDocs(emp)} title="Official Documents"><FolderOpen size={15} /></button>

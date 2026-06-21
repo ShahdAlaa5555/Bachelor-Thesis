@@ -42,7 +42,10 @@ function handlePrismaError(err) {
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
     switch (err.code) {
       case 'P2002': {
-        const field = err.meta?.target?.join(', ') || 'field';
+        const target = err.meta?.target;
+        const field = Array.isArray(target)
+          ? target.join(', ')
+          : (typeof target === 'string' ? target : 'field');
         return new AppError(`A record with this ${field} already exists.`, 409, 'DUPLICATE_ENTRY');
       }
       case 'P2025':

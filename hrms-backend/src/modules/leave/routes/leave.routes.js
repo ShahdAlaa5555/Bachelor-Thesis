@@ -51,7 +51,13 @@ router.get('/requests/:id', ctrl.getLeaveRequest);
 router.patch('/requests/:id', validate(v.updateLeaveRequestSchema), ctrl.updateLeaveRequest);
 router.patch('/requests/:id/approve', authorize('Manager', 'HR', 'Admin'), validate(v.approveRejectSchema), ctrl.approveReject);
 router.patch('/requests/:id/cancel', validate(v.cancelLeaveRequestSchema), ctrl.cancelLeave);
-router.patch('/requests/:id/delegate', authorize('Manager', 'Admin'), validate(v.delegateApprovalSchema), ctrl.delegateApproval);
+// leave.routes.js
+router.post('/delegate', authorize('Manager', 'Admin','HR'), validate(v.delegateApprovalSchema), ctrl.delegateApproval);
+router.post(
+  '/settings/carryover', 
+  authorize('Manager', 'HR', 'Admin'), 
+  ctrl.triggerYearEndCarryover
+);
 
 // ── Balance & Admin ───────────────────────────────────────────────────────
 router.post('/balances/initialize', authorize('HR', 'Admin'), validate(v.initializeBalanceSchema), ctrl.initializeBalances);
@@ -65,6 +71,6 @@ router.get('/analytics', authorize('Manager', 'HR', 'Admin'), ctrl.getLeaveAnaly
 
 // ── Payroll Sync ──────────────────────────────────────────────────────────
 router.post('/requests/:id/sync-payroll', authorize('HR', 'Admin', 'Payroll'), ctrl.syncLeaveToPayroll);
-router.post('/sync/payroll/bulk', authorize('HR', 'Admin', 'Payroll'), ctrl.syncLeaveToPayroll);
+router.post('/sync/payroll/bulk', authorize('HR', 'Admin', 'Payroll'), ctrl.bulkSyncPayroll);
 
 module.exports = router;

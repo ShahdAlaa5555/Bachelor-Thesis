@@ -225,27 +225,29 @@ function AttendanceCalendar({ data }) {
   );
 }
 
-/* ── Correction Request Modal ── */
-function CorrectionModal({ open, onClose, attendanceId, onSubmit, loading }) {
+function CorrectionModal({ open, onClose, attendance, onSubmit, loading }) {
   const [form, setForm] = useState({ Reason: '', CorrectedCheckIn: '', CorrectedCheckOut: '' });
 
-  // Reset form when modal opens
   useEffect(() => {
     if (open) setForm({ Reason: '', CorrectedCheckIn: '', CorrectedCheckOut: '' });
   }, [open]);
 
+  const toISO = (timeStr) => {
+    if (!timeStr || !attendance?.AttendanceDate) return null;
+    const dateOnly = new Date(attendance.AttendanceDate).toISOString().split('T')[0];
+    return new Date(`${dateOnly}T${timeStr}:00`).toISOString();
+  };
+
   const handleSubmit = () => {
-    if (!form.Reason.trim()) {
-      return; // basic guard — parent will handle API error
-    }
-    // FIX: map to exact field names the service expects
+    if (!form.Reason.trim()) return;
     const payload = {
       Reason: form.Reason,
-      CorrectedCheckIn:  form.CorrectedCheckIn  || null,
-      CorrectedCheckOut: form.CorrectedCheckOut || null,
+      CorrectedCheckIn:  toISO(form.CorrectedCheckIn),
+      CorrectedCheckOut: toISO(form.CorrectedCheckOut),
     };
     onSubmit(payload);
   };
+
 
   return (
     <Modal
@@ -297,7 +299,7 @@ function CorrectionModal({ open, onClose, attendanceId, onSubmit, loading }) {
 /* ── Main ── */
 export default function AttendancePage() {
   const { user }  = useAuth();
-  const isManager = ['Manager','HR','Admin'].includes(user?.role);
+  const isManager = ['HR','Admin'].includes(user?.role);
   const [tab, setTab]               = useState('today');
   const [today, setToday]           = useState(null);
   const [kpis, setKpis]             = useState(null);
@@ -444,18 +446,18 @@ export default function AttendancePage() {
   };
 
   // FIX: payload keys now match exactly what the service expects
-  const handleCorrection = async (payload) => {
-    if (!corrModal) return;
-    setCorrLoading(true);
-    try {
-      await attendanceAPI.submitCorrection(corrModal, payload);
-      toast.success('Correction request submitted');
-      setCorrModal(null);
-      loadAll(); // refresh so the pending corrections badge updates
-    } catch (err) {
-      toast.error(err.response?.data?.error?.message || 'Failed to submit correction');
-    } finally { setCorrLoading(false); }
-  };
+ const handleCorrection = async (payload) => {
+  if (!corrModal) return;
+  setCorrLoading(true);
+  try {
+    await attendanceAPI.submitCorrection(corrModal.AttendanceID, payload);
+    toast.success('Correction request submitted');
+    setCorrModal(null);
+    loadAll();
+  } catch (err) {
+    toast.error(err.response?.data?.error?.message || 'Failed to submit correction');
+  } finally { setCorrLoading(false); }
+};
 
   const pendingCorrCount = corrections.filter(c => (c.Status || c.status) === 'Pending').length;
 
@@ -763,7 +765,7 @@ export default function AttendancePage() {
                       </td>
                       <td><Badge status={status}>{status}</Badge></td>
                       <td>
-                        <button className="btn btn-ghost btn-sm" onClick={() => setCorrModal(id)}>
+                       <button className="btn btn-ghost btn-sm" onClick={() => setCorrModal(r)}>
                           <AlertTriangle size={13} /> Correction
                         </button>
                       </td>
@@ -857,12 +859,12 @@ export default function AttendancePage() {
 
       {/* Correction Modal */}
       <CorrectionModal
-        open={!!corrModal}
-        onClose={() => setCorrModal(null)}
-        attendanceId={corrModal}
-        onSubmit={handleCorrection}
-        loading={corrLoading}
-      />
+  open={!!corrModal}
+  onClose={() => setCorrModal(null)}
+  attendance={corrModal}
+  onSubmit={handleCorrection}
+  loading={corrLoading}
+/>
     </>
   );
 }
